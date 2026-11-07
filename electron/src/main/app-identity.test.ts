@@ -62,7 +62,7 @@ describe('installAppIdentity', () => {
     expect(menu.setApplicationMenu).toHaveBeenCalledWith(nativeMenu);
   });
 
-  it('redirects Windows Electron paths and environment variables to D:\\Users\\DANIELPANDA\\AppData', () => {
+  it('redirects Windows Electron paths and environment variables to D:\\Users\\mockuser\\AppData', () => {
     const setPath = vi.fn();
     const env: NodeJS.ProcessEnv = {};
     const created: string[] = [];
@@ -72,35 +72,36 @@ describe('installAppIdentity', () => {
       {
         platform: 'win32',
         env,
+        appDataRoot: 'D:\\Users\\mockuser\\AppData',
         pathExists: () => true,
         ensureDir: (dir) => created.push(dir),
       },
     );
 
-    expect(env.APPDATA).toBe('D:\\Users\\DANIELPANDA\\AppData\\Roaming');
-    expect(env.LOCALAPPDATA).toBe('D:\\Users\\DANIELPANDA\\AppData\\Local');
-    expect(env.TEMP).toBe('D:\\Users\\DANIELPANDA\\AppData\\Local\\Temp');
-    expect(env.TMP).toBe('D:\\Users\\DANIELPANDA\\AppData\\Local\\Temp');
+    expect(env.APPDATA).toBe('D:\\Users\\mockuser\\AppData\\Roaming');
+    expect(env.LOCALAPPDATA).toBe('D:\\Users\\mockuser\\AppData\\Local');
+    expect(env.TEMP).toBe('D:\\Users\\mockuser\\AppData\\Local\\Temp');
+    expect(env.TMP).toBe('D:\\Users\\mockuser\\AppData\\Local\\Temp');
     expect(env.OMNIVOICE_ENV_FILE).toBe(
-      'D:\\Users\\DANIELPANDA\\AppData\\Roaming\\.config\\omnivoice\\env',
+      'D:\\Users\\mockuser\\AppData\\Roaming\\.config\\omnivoice\\env',
     );
-    expect(setPath).toHaveBeenCalledWith('appData', 'D:\\Users\\DANIELPANDA\\AppData\\Roaming');
+    expect(setPath).toHaveBeenCalledWith('appData', 'D:\\Users\\mockuser\\AppData\\Roaming');
     expect(setPath).toHaveBeenCalledWith(
       'userData',
-      'D:\\Users\\DANIELPANDA\\AppData\\Roaming\\VoiceStudio',
+      'D:\\Users\\mockuser\\AppData\\Roaming\\VoiceStudio',
     );
     expect(setPath).toHaveBeenCalledWith(
       'cache',
-      'D:\\Users\\DANIELPANDA\\AppData\\Local\\VoiceStudio\\Cache',
+      'D:\\Users\\mockuser\\AppData\\Local\\VoiceStudio\\Cache',
     );
     expect(setPath).toHaveBeenCalledWith(
       'logs',
-      'D:\\Users\\DANIELPANDA\\AppData\\Local\\VoiceStudio\\Logs',
+      'D:\\Users\\mockuser\\AppData\\Local\\VoiceStudio\\Logs',
     );
     expect(setPath).toHaveBeenCalledWith(
       'temp',
-      'D:\\Users\\DANIELPANDA\\AppData\\Local\\Temp',
+      'D:\\Users\\mockuser\\AppData\\Local\\Temp',
     );
-    expect(created).toContain('D:\\Users\\DANIELPANDA\\AppData\\Local\\OmniVoice\\hf_cache');
+    expect(created).toContain('D:\\Users\\mockuser\\AppData\\Local\\OmniVoice\\hf_cache');
   });
 });

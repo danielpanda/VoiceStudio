@@ -72,9 +72,21 @@ export async function setupApi({
   return 0;
 }
 
+function resolveWindowsAppDataRoot(env = process.env) {
+  if (env.VOICESTUDIO_APPDATA_ROOT?.trim()) return env.VOICESTUDIO_APPDATA_ROOT.trim();
+  const username = env.USERNAME || env.USER || "";
+  if (username) {
+    const candidate = resolve("D:", "Users", username, "AppData");
+    if (existsSync(candidate)) return candidate;
+  }
+  if (existsSync("D:\\AppData")) return "D:\\AppData";
+  if (username) return resolve("D:", "Users", username, "AppData");
+  return "D:\\AppData";
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   if (process.platform === "win32") {
-    const appDataRoot = process.env.VOICESTUDIO_APPDATA_ROOT || "D:\\Users\\DANIELPANDA\\AppData";
+    const appDataRoot = resolveWindowsAppDataRoot();
     process.env.APPDATA ||= resolve(appDataRoot, "Roaming");
     process.env.LOCALAPPDATA ||= resolve(appDataRoot, "Local");
     process.env.TEMP ||= resolve(appDataRoot, "Local", "Temp");

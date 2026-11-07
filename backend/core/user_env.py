@@ -18,15 +18,26 @@ from typing import Optional
 
 import sys
 
-_WIN_D_ROAMING = r"D:\Users\DANIELPANDA\AppData\Roaming"
-USER_ENV_PATH = (
-    os.path.join(_WIN_D_ROAMING, ".config", "omnivoice", "env")
-    if sys.platform == "win32"
-    and "PYTEST_CURRENT_TEST" not in os.environ
-    and "pytest" not in sys.modules
-    and os.path.isdir(_WIN_D_ROAMING)
-    else os.path.expanduser("~/.config/omnivoice/env")
-)
+def _resolve_user_env_path() -> str:
+    if sys.platform == "win32" and "PYTEST_CURRENT_TEST" not in os.environ and "pytest" not in sys.modules:
+        override = os.environ.get("VOICESTUDIO_APPDATA_ROOT", "").strip()
+        if override:
+            d_roaming = os.path.join(override, "Roaming")
+            if os.path.isdir(d_roaming):
+                return os.path.join(d_roaming, ".config", "omnivoice", "env")
+        username = os.environ.get("USERNAME") or (
+            os.path.basename(os.environ.get("USERPROFILE", "")) if os.environ.get("USERPROFILE") else ""
+        )
+        if username:
+            d_user_roaming = os.path.join(r"D:\Users", username, "AppData", "Roaming")
+            if os.path.isdir(d_user_roaming):
+                return os.path.join(d_user_roaming, ".config", "omnivoice", "env")
+        if os.path.isdir(r"D:\AppData\Roaming"):
+            return os.path.join(r"D:\AppData\Roaming", ".config", "omnivoice", "env")
+    return os.path.expanduser("~/.config/omnivoice/env")
+
+
+USER_ENV_PATH = _resolve_user_env_path()
 # Not a Settings choice: Electron saves it here, and a launch that sets another build
 # must still get that build (#3804).
 _LAUNCH_WINS = frozenset({"OMNIVOICE_TORCH_VARIANT"})

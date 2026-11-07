@@ -11,7 +11,24 @@ export interface AppPathConfigurable {
   setPath?(name: string, path: string): void;
 }
 
-export const DEFAULT_WINDOWS_APPDATA_ROOT = 'D:\\Users\\DANIELPANDA\\AppData';
+export function resolveWindowsAppDataRoot(
+  env: NodeJS.ProcessEnv = process.env,
+  pathExists: (path: string) => boolean = existsSync,
+): string {
+  const override = env.VOICESTUDIO_APPDATA_ROOT?.trim();
+  if (override) return override;
+
+  const username = env.USERNAME || env.USER || '';
+  if (username) {
+    const userAppData = join('D:', 'Users', username, 'AppData');
+    if (pathExists(userAppData)) return userAppData;
+  }
+  if (pathExists('D:\\AppData')) return 'D:\\AppData';
+  if (username) return join('D:', 'Users', username, 'AppData');
+  return 'D:\\AppData';
+}
+
+export const DEFAULT_WINDOWS_APPDATA_ROOT = resolveWindowsAppDataRoot();
 
 export function configureWindowsAppData(
   application: Pick<AppPathConfigurable, 'setPath'>,
@@ -27,9 +44,9 @@ export function configureWindowsAppData(
   const env = options.env ?? process.env;
   if (platform !== 'win32' || env.VITEST) return;
 
-  const root =
-    env.VOICESTUDIO_APPDATA_ROOT?.trim() || options.appDataRoot || DEFAULT_WINDOWS_APPDATA_ROOT;
   const pathExists = options.pathExists ?? existsSync;
+  const root =
+    env.VOICESTUDIO_APPDATA_ROOT?.trim() || options.appDataRoot || resolveWindowsAppDataRoot(env, pathExists);
   const ensureDir = options.ensureDir ?? ((dir: string) => mkdirSync(dir, { recursive: true }));
 
   if (!pathExists(root)) {

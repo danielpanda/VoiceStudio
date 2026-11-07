@@ -322,9 +322,21 @@ export function createBackendSupervisor({
   return { start, stop };
 }
 
+function resolveWindowsAppDataRoot(env = process.env) {
+  if (env.VOICESTUDIO_APPDATA_ROOT?.trim()) return env.VOICESTUDIO_APPDATA_ROOT.trim();
+  const username = env.USERNAME || env.USER || "";
+  if (username) {
+    const candidate = path.join("D:", "Users", username, "AppData");
+    if (existsSync(candidate)) return candidate;
+  }
+  if (existsSync("D:\\AppData")) return "D:\\AppData";
+  if (username) return path.join("D:", "Users", username, "AppData");
+  return "D:\\AppData";
+}
+
 function main() {
   if (process.platform === "win32") {
-    const appDataRoot = process.env.VOICESTUDIO_APPDATA_ROOT || "D:\\Users\\DANIELPANDA\\AppData";
+    const appDataRoot = resolveWindowsAppDataRoot();
     process.env.APPDATA = path.join(appDataRoot, "Roaming");
     process.env.LOCALAPPDATA = path.join(appDataRoot, "Local");
     process.env.TEMP = path.join(appDataRoot, "Local", "Temp");

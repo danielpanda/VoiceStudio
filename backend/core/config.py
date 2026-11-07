@@ -2,13 +2,28 @@ import os
 import re
 import sys
 
-_DEFAULT_WIN_APPDATA_ROOT = r"D:\Users\DANIELPANDA\AppData"
+def _get_windows_d_appdata_root() -> str:
+    override = (os.environ.get("VOICESTUDIO_APPDATA_ROOT") or "").strip()
+    if override:
+        return override
+    username = os.environ.get("USERNAME") or (
+        os.path.basename(os.environ.get("USERPROFILE", "")) if os.environ.get("USERPROFILE") else ""
+    )
+    if username:
+        candidate = os.path.join(r"D:\Users", username, "AppData")
+        if os.path.isdir(candidate):
+            return candidate
+    if os.path.isdir(r"D:\AppData"):
+        return r"D:\AppData"
+    if username:
+        return os.path.join(r"D:\Users", username, "AppData")
+    return r"D:\AppData"
 
 
 def _configure_windows_d_appdata():
     if sys.platform != "win32" or "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules:
         return
-    root = (os.environ.get("VOICESTUDIO_APPDATA_ROOT") or _DEFAULT_WIN_APPDATA_ROOT).strip()
+    root = _get_windows_d_appdata_root()
     if not os.path.isdir(root):
         try:
             os.makedirs(root, exist_ok=True)
@@ -22,18 +37,22 @@ def _configure_windows_d_appdata():
             os.makedirs(folder, exist_ok=True)
         except OSError:
             pass
+    userprofile = os.environ.get("USERPROFILE", "")
+    default_c_roaming = os.path.normcase(os.path.normpath(os.path.join(userprofile, "AppData", "Roaming"))) if userprofile else ""
+    default_c_local = os.path.normcase(os.path.normpath(os.path.join(userprofile, "AppData", "Local"))) if userprofile else ""
+    default_c_temp = os.path.normcase(os.path.normpath(os.path.join(userprofile, "AppData", "Local", "Temp"))) if userprofile else ""
+
     cur_appdata = os.path.normcase(os.path.normpath(os.environ.get("APPDATA", ""))) if os.environ.get("APPDATA") else ""
-    if not cur_appdata or cur_appdata == r"c:\users\danielpanda\appdata\roaming":
+    if not cur_appdata or (default_c_roaming and cur_appdata == default_c_roaming) or cur_appdata.startswith("c:\\"):
         os.environ["APPDATA"] = roaming
+
     cur_local = os.path.normcase(os.path.normpath(os.environ.get("LOCALAPPDATA", ""))) if os.environ.get("LOCALAPPDATA") else ""
-    if not cur_local or cur_local == r"c:\users\danielpanda\appdata\local":
+    if not cur_local or (default_c_local and cur_local == default_c_local) or cur_local.startswith("c:\\"):
         os.environ["LOCALAPPDATA"] = local
+
     for key in ("TEMP", "TMP", "TMPDIR"):
         cur_tmp = os.path.normcase(os.path.normpath(os.environ.get(key, ""))) if os.environ.get(key) else ""
-        if not cur_tmp or cur_tmp in (
-            r"c:\users\danielpanda\appdata\local\temp",
-            r"c:\users\daniel~1\appdata\local\temp",
-        ):
+        if not cur_tmp or (default_c_temp and cur_tmp == default_c_temp) or cur_tmp.startswith("c:\\"):
             os.environ[key] = temp_dir
 
 
@@ -47,10 +66,10 @@ def get_app_data_dir():
             sys.platform == "win32"
             and "PYTEST_CURRENT_TEST" not in os.environ
             and "pytest" not in sys.modules
-            and os.path.normcase(os.path.normpath(custom_dir))
-            == r"d:\users\danielpanda\appdata\roaming"
         ):
-            return os.path.join(custom_dir, "OmniVoice")
+            d_roaming = os.path.normcase(os.path.normpath(os.path.join(_get_windows_d_appdata_root(), "Roaming")))
+            if os.path.normcase(os.path.normpath(custom_dir)) == d_roaming:
+                return os.path.join(custom_dir, "OmniVoice")
         return custom_dir
         
     if sys.platform == "darwin":

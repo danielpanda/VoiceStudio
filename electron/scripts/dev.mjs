@@ -446,9 +446,21 @@ export function launchElectronVite(
   });
 }
 
+function resolveWindowsAppDataRoot(env = process.env) {
+  if (env.VOICESTUDIO_APPDATA_ROOT?.trim()) return env.VOICESTUDIO_APPDATA_ROOT.trim();
+  const username = env.USERNAME || env.USER || '';
+  if (username) {
+    const userCandidate = join('D:', 'Users', username, 'AppData');
+    if (existsSync(userCandidate)) return userCandidate;
+  }
+  if (existsSync('D:\\AppData')) return 'D:\\AppData';
+  if (username) return join('D:', 'Users', username, 'AppData');
+  return 'D:\\AppData';
+}
+
 if (isEntryPoint) {
   if (process.platform === 'win32') {
-    const appDataRoot = process.env.VOICESTUDIO_APPDATA_ROOT || 'D:\\Users\\DANIELPANDA\\AppData';
+    const appDataRoot = resolveWindowsAppDataRoot();
     process.env.APPDATA = join(appDataRoot, 'Roaming');
     process.env.LOCALAPPDATA = join(appDataRoot, 'Local');
     process.env.TEMP = join(appDataRoot, 'Local', 'Temp');

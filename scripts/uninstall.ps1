@@ -80,7 +80,18 @@ if ($RemoveApp) {
 }
 
 # ── Resolve platform default paths (mirrors the app) ────────────────────────
-$dAppDataRoot = if ($env:VOICESTUDIO_APPDATA_ROOT) { $env:VOICESTUDIO_APPDATA_ROOT } else { 'D:\Users\DANIELPANDA\AppData' }
+function Get-VoiceStudioAppDataRoot {
+    if ($env:VOICESTUDIO_APPDATA_ROOT) { return $env:VOICESTUDIO_APPDATA_ROOT }
+    $user = if ($env:USERNAME) { $env:USERNAME } else { [Environment]::UserName }
+    if ($user) {
+        $userCandidate = Join-Path "D:\Users" (Join-Path $user "AppData")
+        if (Test-Path -LiteralPath $userCandidate) { return $userCandidate }
+    }
+    if (Test-Path -LiteralPath "D:\AppData") { return "D:\AppData" }
+    if ($user) { return (Join-Path "D:\Users" (Join-Path $user "AppData")) }
+    return "D:\AppData"
+}
+$dAppDataRoot = Get-VoiceStudioAppDataRoot
 $appData   = if (Test-Path -LiteralPath (Join-Path $dAppDataRoot 'Roaming')) { Join-Path $dAppDataRoot 'Roaming' } else { [Environment]::GetEnvironmentVariable('APPDATA') }
 $localApp  = if (Test-Path -LiteralPath (Join-Path $dAppDataRoot 'Local')) { Join-Path $dAppDataRoot 'Local' } else { [Environment]::GetEnvironmentVariable('LOCALAPPDATA') }
 

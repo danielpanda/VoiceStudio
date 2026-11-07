@@ -57,7 +57,18 @@ function Run-Checked([string]$Command, [string[]]$Arguments) {
 }
 if ($vsVersion) { $vsVersion = $vsVersion -replace '^v', ''; Assert-Version $vsVersion }
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$dAppDataRoot = if ($env:VOICESTUDIO_APPDATA_ROOT) { $env:VOICESTUDIO_APPDATA_ROOT } else { 'D:\Users\DANIELPANDA\AppData' }
+function Get-VoiceStudioAppDataRoot {
+    if ($env:VOICESTUDIO_APPDATA_ROOT) { return $env:VOICESTUDIO_APPDATA_ROOT }
+    $user = if ($env:USERNAME) { $env:USERNAME } else { [Environment]::UserName }
+    if ($user) {
+        $userCandidate = Join-Path "D:\Users" (Join-Path $user "AppData")
+        if (Test-Path -LiteralPath $userCandidate) { return $userCandidate }
+    }
+    if (Test-Path -LiteralPath "D:\AppData") { return "D:\AppData" }
+    if ($user) { return (Join-Path "D:\Users" (Join-Path $user "AppData")) }
+    return "D:\AppData"
+}
+$dAppDataRoot = Get-VoiceStudioAppDataRoot
 if (Test-Path -LiteralPath $dAppDataRoot) {
     $env:APPDATA = Join-Path $dAppDataRoot 'Roaming'
     $env:LOCALAPPDATA = Join-Path $dAppDataRoot 'Local'
