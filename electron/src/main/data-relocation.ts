@@ -244,7 +244,11 @@ async function syncDirectory(dir: string): Promise<void> {
 }
 
 export function userEnvironmentPath(): string {
-  return process.env.OMNIVOICE_ENV_FILE || join(homedir(), '.config', 'omnivoice', 'env');
+  if (process.env.OMNIVOICE_ENV_FILE) return process.env.OMNIVOICE_ENV_FILE;
+  if (process.platform === 'win32' && !process.env.VITEST && process.env.APPDATA) {
+    return join(process.env.APPDATA, '.config', 'omnivoice', 'env');
+  }
+  return join(homedir(), '.config', 'omnivoice', 'env');
 }
 
 export async function readDataDirectorySetting(

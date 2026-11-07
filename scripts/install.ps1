@@ -57,6 +57,15 @@ function Run-Checked([string]$Command, [string[]]$Arguments) {
 }
 if ($vsVersion) { $vsVersion = $vsVersion -replace '^v', ''; Assert-Version $vsVersion }
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$dAppDataRoot = if ($env:VOICESTUDIO_APPDATA_ROOT) { $env:VOICESTUDIO_APPDATA_ROOT } else { 'D:\Users\DANIELPANDA\AppData' }
+if (Test-Path -LiteralPath $dAppDataRoot) {
+    $env:APPDATA = Join-Path $dAppDataRoot 'Roaming'
+    $env:LOCALAPPDATA = Join-Path $dAppDataRoot 'Local'
+    $dTemp = Join-Path $env:LOCALAPPDATA 'Temp'
+    New-Item -ItemType Directory -Force -Path $dTemp | Out-Null
+    $env:TEMP = $dTemp
+    $env:TMP = $dTemp
+}
 $work = Join-Path ([IO.Path]::GetTempPath()) ('voicestudio-install-' + [Guid]::NewGuid())
 New-Item -ItemType Directory -Path $work | Out-Null
 try {

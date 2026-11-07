@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
   VoiceStudio — clean uninstaller (Windows).
 
@@ -80,8 +80,10 @@ if ($RemoveApp) {
 }
 
 # ── Resolve platform default paths (mirrors the app) ────────────────────────
-$appData   = [Environment]::GetEnvironmentVariable('APPDATA')
-$localApp   = [Environment]::GetEnvironmentVariable('LOCALAPPDATA')
+$dAppDataRoot = if ($env:VOICESTUDIO_APPDATA_ROOT) { $env:VOICESTUDIO_APPDATA_ROOT } else { 'D:\Users\DANIELPANDA\AppData' }
+$appData   = if (Test-Path -LiteralPath (Join-Path $dAppDataRoot 'Roaming')) { Join-Path $dAppDataRoot 'Roaming' } else { [Environment]::GetEnvironmentVariable('APPDATA') }
+$localApp  = if (Test-Path -LiteralPath (Join-Path $dAppDataRoot 'Local')) { Join-Path $dAppDataRoot 'Local' } else { [Environment]::GetEnvironmentVariable('LOCALAPPDATA') }
+
 
 $dataDefault   = Join-Path $appData 'OmniVoice'
 # Electron keeps its runtime, window state and logs in its app folder.
@@ -142,7 +144,7 @@ try {
 # omnivoice/env') on EVERY OS, so it lands under %USERPROFILE% on Windows too. It
 # persists OMNIVOICE_CACHE_DIR (and can hold HF_TOKEN); leaving it behind silently
 # redirected a fresh reinstall's model cache to the old location.
-$userEnvDir = Join-Path ([Environment]::GetEnvironmentVariable('USERPROFILE')) '.config\omnivoice'
+$userEnvDir = if ($appData) { Join-Path $appData '.config\omnivoice' } else { Join-Path ([Environment]::GetEnvironmentVariable('USERPROFILE')) '.config\omnivoice' }
 
 $appTargets = @()
 foreach ($p in @($dataDir, $electronUserData, $electronRuntime, $electronCache) + $legacyConfig + @($logsDefault, $userEnvDir)) {
@@ -230,7 +232,7 @@ if ($Models -and $modelsPresent) {
   Remove-Item -LiteralPath $modelsDir -Recurse -Force -ErrorAction SilentlyContinue
   $deleted++
 } elseif ($modelsPresent) {
-  Write-Host "Kept model cache ($modelsDir) — re-run with -Models to remove it."
+  Write-Host "Kept model cache ($modelsDir) -- re-run with -Models to remove it."
 }
 if ($RemoveApp -and $nsisUninstaller) {
   Write-Host 'Uninstalling VoiceStudio...'
@@ -238,17 +240,17 @@ if ($RemoveApp -and $nsisUninstaller) {
   if ($nsisScope) { $arguments = @($nsisScope) + $arguments }
   $process = Start-Process -FilePath $nsisUninstaller -ArgumentList $arguments -Wait -PassThru
   if ($process.ExitCode -in @(0, 3010)) { Write-Host 'VoiceStudio uninstalled.' }
-  else { Write-Host "The uninstaller exited with $($process.ExitCode) — remove it via Settings > Apps if it is still listed." }
+  else { Write-Host "The uninstaller exited with $($process.ExitCode) -- remove it via Settings > Apps if it is still listed." }
 }
 if ($RemoveApp -and $msiProduct) {
   Write-Host "Uninstalling $($msiProduct.DisplayName) via msiexec..."
   $process = Start-Process msiexec.exe -ArgumentList '/x', $msiProduct.PSChildName, '/norestart', '/qn' -Wait -PassThru
   if ($process.ExitCode -in @(0, 3010)) { Write-Host 'MSI product uninstalled.' }
-  else { Write-Host "msiexec exited with $($process.ExitCode) — remove it via Settings > Apps if it is still listed." }
+  else { Write-Host "msiexec exited with $($process.ExitCode) -- remove it via Settings > Apps if it is still listed." }
 }
 
 Write-Host ''
-Write-Host "Done — removed $deleted folder(s)."
+Write-Host "Done -- removed $deleted folder(s)."
 if (-not $RemoveApp) {
   Write-Host 'To also uninstall the app: re-run with -RemoveApp, or use Settings > Apps.'
 }

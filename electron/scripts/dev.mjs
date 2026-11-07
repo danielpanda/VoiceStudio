@@ -188,5 +188,13 @@ export function launchElectronVite(
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  if (process.platform === 'win32') {
+    const appDataRoot = process.env.VOICESTUDIO_APPDATA_ROOT || 'D:\\Users\\DANIELPANDA\\AppData';
+    process.env.APPDATA = join(appDataRoot, 'Roaming');
+    process.env.LOCALAPPDATA = join(appDataRoot, 'Local');
+    process.env.TEMP = join(appDataRoot, 'Local', 'Temp');
+    process.env.TMP = join(appDataRoot, 'Local', 'Temp');
+    process.env.OMNIVOICE_ENV_FILE ||= join(appDataRoot, 'Roaming', '.config', 'omnivoice', 'env');
+  }
   launchElectronVite();
 }

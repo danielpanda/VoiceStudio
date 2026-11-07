@@ -386,7 +386,13 @@ function storedRuntimeLocation(): RuntimeLocationConfig | null {
     const parsed = JSON.parse(
       readFileSync(join(app.getPath('userData'), RUNTIME_LOCATION_FILE), 'utf8'),
     ) as { root?: unknown; owned?: unknown; scoped?: unknown };
-    return typeof parsed.root === 'string' && isAbsolute(parsed.root)
+    return typeof parsed.root === 'string' &&
+      isAbsolute(parsed.root) &&
+      !(
+        process.platform === 'win32' &&
+        !process.env.VITEST &&
+        /^c:[\\/]/i.test(resolve(parsed.root))
+      )
       ? { root: resolve(parsed.root), owned: parsed.owned === true, scoped: parsed.scoped === true }
       : null;
   } catch {

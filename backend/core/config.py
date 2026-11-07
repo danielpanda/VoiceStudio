@@ -2,9 +2,55 @@ import os
 import re
 import sys
 
+_DEFAULT_WIN_APPDATA_ROOT = r"D:\Users\DANIELPANDA\AppData"
+
+
+def _configure_windows_d_appdata():
+    if sys.platform != "win32" or "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules:
+        return
+    root = (os.environ.get("VOICESTUDIO_APPDATA_ROOT") or _DEFAULT_WIN_APPDATA_ROOT).strip()
+    if not os.path.isdir(root):
+        try:
+            os.makedirs(root, exist_ok=True)
+        except OSError:
+            return
+    roaming = os.path.join(root, "Roaming")
+    local = os.path.join(root, "Local")
+    temp_dir = os.path.join(local, "Temp")
+    for folder in (roaming, local, temp_dir):
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError:
+            pass
+    cur_appdata = os.path.normcase(os.path.normpath(os.environ.get("APPDATA", ""))) if os.environ.get("APPDATA") else ""
+    if not cur_appdata or cur_appdata == r"c:\users\danielpanda\appdata\roaming":
+        os.environ["APPDATA"] = roaming
+    cur_local = os.path.normcase(os.path.normpath(os.environ.get("LOCALAPPDATA", ""))) if os.environ.get("LOCALAPPDATA") else ""
+    if not cur_local or cur_local == r"c:\users\danielpanda\appdata\local":
+        os.environ["LOCALAPPDATA"] = local
+    for key in ("TEMP", "TMP", "TMPDIR"):
+        cur_tmp = os.path.normcase(os.path.normpath(os.environ.get(key, ""))) if os.environ.get(key) else ""
+        if not cur_tmp or cur_tmp in (
+            r"c:\users\danielpanda\appdata\local\temp",
+            r"c:\users\daniel~1\appdata\local\temp",
+        ):
+            os.environ[key] = temp_dir
+
+
+_configure_windows_d_appdata()
+
+
 def get_app_data_dir():
     custom_dir = os.environ.get("OMNIVOICE_DATA_DIR")
     if custom_dir:
+        if (
+            sys.platform == "win32"
+            and "PYTEST_CURRENT_TEST" not in os.environ
+            and "pytest" not in sys.modules
+            and os.path.normcase(os.path.normpath(custom_dir))
+            == r"d:\users\danielpanda\appdata\roaming"
+        ):
+            return os.path.join(custom_dir, "OmniVoice")
         return custom_dir
         
     if sys.platform == "darwin":

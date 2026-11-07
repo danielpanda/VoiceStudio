@@ -330,6 +330,14 @@ export function createBackendSupervisor({
 }
 
 function main() {
+  if (process.platform === "win32") {
+    const appDataRoot = process.env.VOICESTUDIO_APPDATA_ROOT || "D:\\Users\\DANIELPANDA\\AppData";
+    process.env.APPDATA = path.join(appDataRoot, "Roaming");
+    process.env.LOCALAPPDATA = path.join(appDataRoot, "Local");
+    process.env.TEMP = path.join(appDataRoot, "Local", "Temp");
+    process.env.TMP = path.join(appDataRoot, "Local", "Temp");
+    process.env.OMNIVOICE_ENV_FILE ||= path.join(appDataRoot, "Roaming", ".config", "omnivoice", "env");
+  }
   const supervisor = createBackendSupervisor();
 
   // A Ctrl+C / concurrently teardown is a DELIBERATE stop — no scary banner

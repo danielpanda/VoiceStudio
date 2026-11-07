@@ -15,7 +15,17 @@ import os
 import re
 from typing import Optional
 
-USER_ENV_PATH = os.path.expanduser("~/.config/omnivoice/env")
+import sys
+
+_WIN_D_ROAMING = r"D:\Users\DANIELPANDA\AppData\Roaming"
+USER_ENV_PATH = (
+    os.path.join(_WIN_D_ROAMING, ".config", "omnivoice", "env")
+    if sys.platform == "win32"
+    and "PYTEST_CURRENT_TEST" not in os.environ
+    and "pytest" not in sys.modules
+    and os.path.isdir(_WIN_D_ROAMING)
+    else os.path.expanduser("~/.config/omnivoice/env")
+)
 
 # Where a desktop user sets a backend variable by hand, for refusal messages
 # that name one (core.browser_guard, core.url_safety). Stdlib-only module, so

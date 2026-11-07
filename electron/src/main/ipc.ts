@@ -39,7 +39,11 @@ import {
   scanResetScopes,
   type ResetRoots,
 } from './reset-data';
-import { inspectDataRelocation, relocateDataDirectory } from './data-relocation';
+import {
+  inspectDataRelocation,
+  relocateDataDirectory,
+  userEnvironmentPath,
+} from './data-relocation';
 import { createUninstallPlan, scanUninstallTargets, type UninstallRoots } from './uninstall-data';
 import { scheduleUninstallCleanup } from './uninstall-cleanup';
 import { sendToLiveWindow } from './window-safety';

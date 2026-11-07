@@ -194,6 +194,7 @@ export default {
     oneClick: false,
     allowToChangeInstallationDirectory: true,
     perMachine: false,
+    include: 'build/installer.nsh',
   },
   mac: {
     icon: 'build/icons/icon.icns',

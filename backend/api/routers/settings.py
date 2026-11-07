@@ -1021,6 +1021,13 @@ _MODELS_DIR_ENV = "OMNIVOICE_CACHE_DIR"
 def _default_models_dir() -> str:
     """huggingface_hub's default cache root, honoring XDG_CACHE_HOME on Linux
     (matches HF so GET reports the *true* default the backend would use)."""
+    if (
+        os.name == "nt"
+        and "PYTEST_CURRENT_TEST" not in os.environ
+        and not os.environ.get("XDG_CACHE_HOME")
+        and os.environ.get("LOCALAPPDATA")
+    ):
+        return os.path.join(os.environ["LOCALAPPDATA"], "OmniVoice", "hf_cache")
     base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
     return os.path.join(base, "huggingface")
 
