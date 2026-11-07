@@ -6,7 +6,12 @@ import { AccountController, registerAccountIpc } from './account-ipc';
 import { AccountSession } from './account-session';
 import { startAccountTokenBridge } from './account-token-bridge';
 import { CloudActivity } from './cloud-activity';
-import { cloudAccountsAvailable, cloudOrigins, resolveCloudEnvironment } from './cloud-config';
+import {
+  cloudAccountsAvailable,
+  cloudOrigins,
+  dashboardLinks,
+  resolveCloudEnvironment,
+} from './cloud-config';
 import { CloudSwitchStore } from './cloud-switches';
 import { startLoopback } from './loopback';
 import { OidcClient } from './oidc';
@@ -39,11 +44,12 @@ export async function startAccount(opts: StartOptions): Promise<() => void> {
 }
 
 async function wireAccount(opts: StartOptions): Promise<() => void> {
-  const available = cloudAccountsAvailable(app.isPackaged);
   const env = resolveCloudEnvironment({
     packaged: app.isPackaged,
     requested: process.env.VOICESTUDIO_CLOUD_ENV,
+    clientId: process.env.VOICESTUDIO_CLOUD_CLIENT_ID,
   });
+  const available = cloudAccountsAvailable(env);
   const switches = new CloudSwitchStore(join(app.getPath('userData'), 'cloud-switches.json'));
   const allowed = () => available && switches.get().accountEnabled;
   const activity = new CloudActivity({ isAllowed: allowed, origins: cloudOrigins(env) });
@@ -74,6 +80,7 @@ async function wireAccount(opts: StartOptions): Promise<() => void> {
     session,
     api,
     remembered: store.persistent,
+    links: dashboardLinks(env),
   });
   const closeIpc = registerAccountIpc(ctl, session, opts.getMainWindow);
   if (!available)
@@ -99,7 +106,9 @@ async function wireAccount(opts: StartOptions): Promise<() => void> {
   // (switch changes, sign-in, sign-out or an expired session), never in between.
   const shouldSync = () => {
     const s = switches.get();
-    return s.accountEnabled && s.syncEnabled && session.state().signedIn;
+    return (
+      s.accountEnabled && s.syncEnabled && session.state().signedIn && Boolean(session.accountId())
+    );
   };
   let syncing = shouldSync();
   const reconcile = () => {

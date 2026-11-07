@@ -1,4 +1,9 @@
-/** VoiceStudio Cloud endpoints (vssaas desktop-app-guide §1). One block per environment. */
+/**
+ * VoiceStudio Cloud endpoints, one block per environment in `config/account.json`.
+ * Interactive sign-in starts on the dashboard, which owns session freshness and approval.
+ * Zitadel remains the issuer for app token refresh and revocation.
+ */
+import { ACCOUNT_CONFIG } from '../../../../config/account-config.mjs';
 export type CloudEnvName = 'prod' | 'dev' | 'local';
 
 export interface CloudEnvironment {
@@ -6,55 +11,63 @@ export interface CloudEnvironment {
   issuer: string;
   accountApi: string;
   syncApi: string;
+  /** The web dashboard: the browser lands here after sign-in, and the account screen links to it. */
+  dashboard: string;
   signedInPage: string;
   clientId: string;
 }
 
-const CLIENT_ID = 'voicestudio-desktop-oss';
-
-const ENVIRONMENTS: Record<CloudEnvName, Omit<CloudEnvironment, 'name' | 'clientId'>> = {
-  prod: {
-    issuer: 'https://voicestudio.sh/identity/realms/vssaas',
-    accountApi: 'https://appapi.voicestudio.sh/v1/account',
-    syncApi: 'https://appapi.voicestudio.sh/v1/sync',
-    signedInPage: 'https://app.voicestudio.sh/app/desktop-signed-in',
-  },
-  dev: {
-    issuer: 'https://dev-app.voicestudio.sh/identity/realms/vssaas',
-    accountApi: 'https://dev-appapi.voicestudio.sh/v1/account',
-    syncApi: 'https://dev-appapi.voicestudio.sh/v1/sync',
-    signedInPage: 'https://dev-app.voicestudio.sh/app/desktop-signed-in',
-  },
-  local: {
-    issuer: 'http://127.0.0.1:3000/identity/realms/vssaas',
-    accountApi: 'http://127.0.0.1:8080/v1/account',
-    syncApi: 'http://127.0.0.1:8090/v1/sync',
-    signedInPage: 'http://127.0.0.1:3000/app/desktop-signed-in',
-  },
-};
+const ENVIRONMENTS = ACCOUNT_CONFIG.environments;
 
 export function resolveCloudEnvironment(opts: {
   packaged: boolean;
   requested?: string;
+  /** VOICESTUDIO_CLOUD_CLIENT_ID; honoured in developer builds only. */
+  clientId?: string;
 }): CloudEnvironment {
   const requested = opts.requested as CloudEnvName | undefined;
   const name: CloudEnvName = opts.packaged
     ? 'prod'
     : requested && Object.hasOwn(ENVIRONMENTS, requested)
       ? requested
-      : 'dev';
-  return { name, clientId: CLIENT_ID, ...ENVIRONMENTS[name] };
+      : 'prod';
+  const { clientId, ...endpoints } = ENVIRONMENTS[name];
+  const override = opts.packaged ? '' : (opts.clientId?.trim() ?? '');
+  return {
+    name,
+    ...endpoints,
+    signedInPage: `${endpoints.dashboard}/desktop-signed-in`,
+    clientId: override || clientId,
+  };
 }
 
-/** Sync origins join in S1; S0 talks only to the issuer and the account API. */
+/** Only the configured first-party identity, account and dashboard origins are allowed. */
 export function cloudOrigins(env: CloudEnvironment): Set<string> {
-  return new Set([new URL(env.issuer).origin, new URL(env.accountApi).origin]);
+  return new Set([
+    new URL(env.issuer).origin,
+    new URL(env.accountApi).origin,
+    new URL(env.dashboard).origin,
+  ]);
+}
+
+/** The dashboard pages the account screen opens in the browser. */
+export function dashboardLinks(env: CloudEnvironment): {
+  profile: string;
+  plan: string;
+  deletion: string;
+} {
+  return {
+    profile: `${env.dashboard}/settings/profile`,
+    plan: `${env.dashboard}/settings/plan`,
+    deletion: `${env.dashboard}/settings/deletion-review`,
+  };
 }
 
 /**
- * On in developer builds; packaged builds need VOICESTUDIO_CLOUD_ACCOUNTS=1 at build
- * time, so releases ship it dark until the vssaas production API launches.
+ * Sign-in is offered wherever the environment has a client to sign in with: production and
+ * dev always do; a local stack needs VOICESTUDIO_CLOUD_CLIENT_ID. Each user still turns
+ * accounts on themselves (off by default), and nothing contacts VoiceStudio Cloud until then.
  */
-export function cloudAccountsAvailable(packaged: boolean): boolean {
-  return !packaged || (typeof __CLOUD_ACCOUNTS__ === 'boolean' && __CLOUD_ACCOUNTS__);
+export function cloudAccountsAvailable(env: CloudEnvironment): boolean {
+  return env.clientId !== '';
 }

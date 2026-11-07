@@ -1,6 +1,6 @@
-// Live smoke for VoiceStudio Cloud sign-in against the dev realm. Needs a built app
-// (`bun run build`), a display (xvfb-run on Linux) and network access to dev-app.voicestudio.sh.
-// It stops at the Keycloak login page: finishing sign-in needs a dev test account.
+// Live smoke for VoiceStudio Cloud sign-in against production. Needs a built app
+// (`bun run build`), a display (xvfb-run on Linux) and network access to app.voicestudio.sh.
+// It stops at the sign-in page: finishing sign-in needs a real account.
 import { _electron as electron } from "playwright";
 import { mkdtempSync } from "node:fs";
 import { connect } from "node:net";
@@ -8,8 +8,10 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
+import { ACCOUNT_CONFIG } from "../../config/account-config.mjs";
 
-const ISSUER = "https://dev-app.voicestudio.sh/identity/realms/vssaas";
+const { issuer: ISSUER, dashboard: DASHBOARD, clientId: CLIENT_ID } =
+  ACCOUNT_CONFIG.environments.prod;
 const workspaceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const executable =
   process.platform === "win32"
@@ -43,8 +45,8 @@ const app = await electron.launch({
   env: {
     ...launchEnvironment,
     ELECTRON_RENDERER_URL: "",
-    VOICESTUDIO_CLOUD_ENV: "dev",
-    VOICESTUDIO_ELECTRON_PROXY_PORT: "49305",
+    VOICESTUDIO_CLOUD_ENV: "prod",
+    VOICESTUDIO_ELECTRON_PROXY_PORT: "0",
     VOICESTUDIO_SKIP_BACKEND: "1",
     VOICESTUDIO_ALLOW_MULTIPLE_INSTANCES: "1",
   },
@@ -109,7 +111,7 @@ try {
       path: join(screenshots, "account-signed-out.png"),
     });
 
-  // Sign in: discovery against the dev realm, then a PKCE authorize URL to a loopback redirect.
+  // Sign in: the browser opens the dashboard's app sign-in with PKCE and a loopback redirect.
   await signIn.click();
   await page.waitForFunction(
     async () => (await window.voicestudio.account.get()).signingIn,
@@ -123,9 +125,14 @@ try {
   const url = new URL(authorize);
   assert.equal(
     `${url.origin}${url.pathname}`,
-    `${ISSUER}/protocol/openid-connect/auth`,
+    `${DASHBOARD}/auth/app`,
   );
-  assert.equal(url.searchParams.get("client_id"), "voicestudio-desktop-oss");
+  assert.equal(url.searchParams.get("client_id"), CLIENT_ID);
+  assert.equal(url.searchParams.get("prompt"), "consent");
+  assert.equal(
+    url.searchParams.get("max_age"),
+    String(ACCOUNT_CONFIG.browserSessionMaxAgeSeconds),
+  );
   assert.equal(url.searchParams.get("response_type"), "code");
   assert.equal(url.searchParams.get("code_challenge_method"), "S256");
   assert.match(
@@ -144,16 +151,17 @@ try {
       path: join(screenshots, "account-signing-in.png"),
     });
 
-  // The realm accepts this client and loopback redirect: Keycloak serves its login form.
+  // The dashboard accepts this client and loopback redirect and hands over to the
+  // sign-in page on the identity host.
   const login = await fetch(authorize, { redirect: "follow" });
   const html = await login.text();
   assert.equal(login.status, 200, `authorize page answered ${login.status}`);
-  const pageId = html.match(/"pageId":\s*"([^"]+)"/)?.[1];
-  assert.match(
-    pageId ?? "",
-    /^login/,
-    `Keycloak showed "${pageId}" instead of its login form`,
+  assert.equal(
+    `${new URL(login.url).origin}${new URL(login.url).pathname}`,
+    `${ISSUER}/login`,
+    `authorize ended at ${login.url} instead of the sign-in page`,
   );
+  assert.match(html, /<form/i, "the sign-in page has no form");
 
   // Off again: sign-in is abandoned and the listener closes at once, with no restart.
   state = await account("setSwitches", { accountEnabled: false });
