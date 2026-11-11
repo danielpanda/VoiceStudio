@@ -10,10 +10,11 @@ _backend_dir = os.path.dirname(os.path.abspath(__file__))
 if _backend_dir not in sys.path:
     sys.path.insert(0, _backend_dir)
 
-from core.crash_diagnostics import enable_fault_handler  # noqa: E402
+from core.crash_diagnostics import enable_fault_handler, install_exit_forensics  # noqa: E402
 from core.app_config import PRODUCT_NAME  # noqa: E402
 # Arm native-crash tracebacks before model or GPU libraries can be imported.
 enable_fault_handler()
+install_exit_forensics()
 # PyInstaller re-executes this entry module when the frozen backend binary is
 # launched. Nested operation supervisors therefore dispatch here, before math,
 # logging, FastAPI, torch, or any application initialization. Source launches
@@ -814,13 +815,14 @@ def _phase_a_build_inner() -> None:
         media_tools as media_tools_router,  # Audio tools: ffmpeg/ffprobe/yt-dlp
         auth as auth_router,
         voice_convert,  # Studio Convert: speech-to-speech via ASR → TTS
+        sfx,  # Tools > Sound effects (#3577): opt-in MOSS-SoundEffect sidecar
     )
     from api.routers import mcp_bindings as _mcp_bindings_router  # noqa: E402
     from api.routers import telephony_twilio as _telephony_twilio_router  # noqa: E402
     from api.routers import calls as _calls_router  # noqa: E402
     from api.routers import cloud_sync as _cloud_sync_router  # noqa: E402
     _router_modules.extend([
-        system, profiles, profile_images, exports, generation, voice_convert, dub_core, dub_generate,
+        system, profiles, profile_images, exports, generation, voice_convert, sfx, dub_core, dub_generate,
         dub_export, dub_translate, projects, glossary, engines, tools,
         stories, setup, gallery, archetypes, describe_voice, community,
         batch, watermark, events, capture, capture_ws, speech_platform, dictation,
@@ -1256,7 +1258,7 @@ async def _phase_b(app: FastAPI) -> None:
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def _application_lifespan(app: FastAPI):
     from api.dependencies import validate_server_admin_key
 
     validate_server_admin_key()
@@ -1477,6 +1479,18 @@ async def lifespan(app: FastAPI):
 
 
 from core.version import APP_VERSION  # single source of truth (pyproject metadata)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    from core.runtime_owner import DataDirectoryLease
+    from core.config import DATA_DIR
+    # One backend per data directory: two would race on the database, job
+    # recovery and model files. Held through teardown, where workers can still
+    # write. The short wait covers a restart whose predecessor is still exiting.
+    with DataDirectoryLease(DATA_DIR, timeout=15):
+        async with _application_lifespan(app):
+            yield
+
 
 app = FastAPI(
     title=f"{PRODUCT_NAME} API",
@@ -1989,6 +2003,9 @@ _allowed = allowed_origin_values()
 # Registered FIRST → innermost: the startup gate holds every request except
 # the two probe paths until the deferred startup completes (and is a no-op
 # forever after).
+from core.activity import ActivityMiddleware
+# Innermost: only requests that passed every gate count as use of the backend.
+app.add_middleware(ActivityMiddleware)
 from core.render_trace import RenderTraceMiddleware
 app.add_middleware(RenderTraceMiddleware)
 app.add_middleware(StartupGateMiddleware)
@@ -2173,6 +2190,14 @@ async def health():
         "engine": engine,
         "version": APP_VERSION,
     }
+
+
+# The desktop app polls this to stop a backend it started for terminal
+# commands once nothing has used it for a while (see core/activity.py).
+@app.get("/system/activity", include_in_schema=False)
+async def system_activity():
+    from core import activity
+    return activity.snapshot()
 
 
 # ── Startup progress ────────────────────────────────────────────────────

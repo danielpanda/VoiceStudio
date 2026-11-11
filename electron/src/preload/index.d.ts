@@ -8,6 +8,13 @@ import type { InstallFailure } from '../shared/utils/installFailure';
  * (src/preload/index.ts) and the renderer. Both tsconfigs include it.
  */
 
+export interface TerminalCommandStatus {
+  supported: boolean;
+  linked: boolean;
+  onPath: boolean;
+  command: string;
+}
+
 export type BackendStage =
   | 'setup_required'
   | 'installing'
@@ -54,6 +61,12 @@ export interface BackendStatus {
     | 'install_stuck';
   /** Free disk (GiB) the failed install needed; the CPU-only install needs less than the CUDA one. */
   setupRequiredGib?: number;
+  /** Detected hardware and the PyTorch build the runtime install will pick (setup screen). */
+  setupHardware?: {
+    gpu?: string;
+    build: 'metal' | 'cuda' | 'rocm' | 'cpu';
+    reason?: 'no_nvidia' | 'windows_arm' | 'explicit';
+  };
   /** A prior explicit install stopped after creating its resumable project/cache. */
   runtimeInterrupted?: boolean;
   /** Automatic repair of a lost Python environment already ran this launch and failed. */
@@ -118,6 +131,23 @@ export interface RuntimeLocation {
   custom: boolean;
 }
 
+export interface PythonRuntimeCandidate {
+  pythonPath: string;
+  source: string;
+  version?: string;
+}
+export interface PythonRuntimeDiscoveryWarning {
+  path: string;
+  reason: 'permission_denied' | 'scan_limit' | 'read_error';
+}
+export interface PythonDiscoveryResult {
+  candidates: PythonRuntimeCandidate[];
+  warnings: PythonRuntimeDiscoveryWarning[];
+  partial: boolean;
+  scannedRoots: string[];
+}
+export interface PythonRepairPlan { interpreter: string; packages: string[]; }
+
 export interface BackendConnection {
   remote: boolean;
   url: string;
@@ -134,13 +164,15 @@ export type UpdateStatus =
   | 'downloaded'
   | 'error';
 export type UpdateChannel = 'stable' | 'beta';
+/** Which step failed; `not-applied` means an installed update did not take effect. */
+export type UpdateErrorKind = 'check' | 'download' | 'verify' | 'install' | 'not-applied';
 export interface UpdateState {
   status: UpdateStatus;
   currentVersion: string;
   /** Absent when this build cannot switch channels (Store builds, dev runs). */
   channel?: UpdateChannel;
   /** Set only while status is 'unsupported': why this build cannot update itself. */
-  unsupportedReason?: 'development' | 'store' | 'package-manager';
+  unsupportedReason?: 'development' | 'store' | 'package-manager' | 'no-update-config';
   availableVersion?: string;
   notes?: string | null;
   progress: number;
@@ -150,6 +182,13 @@ export interface UpdateState {
   etaSeconds?: number;
   lastCheckedAt?: number;
   error?: string;
+  errorKind?: UpdateErrorKind;
+  /** Downloads a found update without asking (packaged builds that update themselves). */
+  autoDownload?: boolean;
+  /** Quitting installs a downloaded update on this install type (not on .deb). */
+  installOnQuit?: boolean;
+  /** The version the user chose "Later" for; it still installs on quit. */
+  dismissedVersion?: string;
 }
 export interface UpdateReleaseInfo {
   version: string;
@@ -421,6 +460,8 @@ export interface VoiceStudioBridge {
     download(): Promise<UpdateState>;
     dismiss(): Promise<UpdateState>;
     setChannel(channel: UpdateChannel): Promise<UpdateState>;
+    setAutoDownload(enabled: boolean): Promise<UpdateState>;
+    later(): Promise<UpdateState>;
     install(): Promise<void>;
     listReleases(): Promise<UpdateReleaseInfo[]>;
     onState(cb: (state: UpdateState) => void): () => void;
@@ -439,6 +480,12 @@ export interface VoiceStudioBridge {
     scan(token: string): Promise<WatchEntry[]>;
     enqueue(request: WatchUpload): Promise<void>;
     stop(token: string): Promise<void>;
+  };
+  /** The `voicestudio` terminal command (macOS and Linux direct downloads). */
+  terminal: {
+    status(): Promise<TerminalCommandStatus>;
+    /** Explicit user action: add ~/.local/bin to the user's shell profiles. */
+    addToPath(): Promise<TerminalCommandStatus>;
   };
   app: {
     /** From the root package.json via __APP_VERSION__ / extraMetadata. */
@@ -464,6 +511,68 @@ export interface VoiceStudioBridge {
     setRuntimeRegion(region: RuntimeRegion): Promise<RuntimeRegion>;
     chooseRuntimeLocation(title: string): Promise<RuntimeLocation | null>;
     useDefaultRuntimeLocation(): Promise<RuntimeLocation>;
+    getPythonRuntime(): Promise<{
+      selection: { pythonPath: string } | null;
+      overrideActive: boolean;
+    }>;
+    choosePythonRuntime(title?: string): Promise<{
+      ok: boolean;
+      canceled?: boolean;
+      pythonPath?: string;
+      version?: string;
+      missingModules?: string[];
+      detail?: string;
+      token?: string;
+      repairPlan?: PythonRepairPlan;
+    }>;
+    confirmPythonRuntime(token: string): Promise<{
+      ok: boolean;
+      pythonPath: string;
+      version?: string;
+      missingModules?: string[];
+      detail?: string;
+      repairPlan?: PythonRepairPlan;
+    }>;
+    planPythonRepair(selectionToken: string): Promise<{
+      ok: boolean;
+      pythonPath: string;
+      version?: string;
+      missingModules?: string[];
+      detail?: string;
+      repairToken?: string;
+      repairPlan?: PythonRepairPlan;
+    }>;
+    installPythonRepair(request: {
+      token: string;
+      pythonPath: string;
+      packages: string[];
+      /** Translated native confirmation labels; the plan itself comes from main. */
+      dialog?: { title: string; message: string; install: string; cancel: string };
+    }): Promise<{
+      ok: boolean;
+      pythonPath: string;
+      version?: string;
+      missingModules?: string[];
+      detail?: string;
+      installed: boolean;
+      canceled?: boolean;
+      token?: string;
+      repairToken?: string;
+      repairPlan?: PythonRepairPlan;
+      outputTail?: string;
+    }>;
+    onPythonRepairProgress(callback: (event: { text: string; stream: 'stdout' | 'stderr' }) => void): () => void;
+    useManagedPython(): Promise<{ ok: boolean }>;
+    discoverPythonRuntimes(): Promise<PythonDiscoveryResult>;
+    useDiscoveredPythonRuntime(pythonPath: string): Promise<{
+      ok: boolean;
+      pythonPath: string;
+      version?: string;
+      missingModules?: string[];
+      detail?: string;
+      token?: string;
+      repairPlan?: PythonRepairPlan;
+    }>;
     getConnection(): Promise<BackendConnection>;
     getHostSnapshot(): Promise<HostSnapshotLike>;
     getSetupDiagnostics(): Promise<string>;

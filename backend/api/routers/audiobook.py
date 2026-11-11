@@ -588,9 +588,15 @@ def _emotion_key(span) -> tuple:
 
 
 def _span_key_extras(span) -> tuple:
-    """Chapter-key elements after speed: ``join`` then emotion, each only when set."""
+    """Chapter-key elements after speed: ``join``, emotion, then an inline
+    ``[[…]]`` override marker, each only when set."""
+    from services.pronunciation import has_inline_override
+
     join = getattr(span, "join", None)
-    return ((join,) if join else ()) + _emotion_key(span)
+    # Chapters with an inline override were rendered with the brackets (and
+    # a dictionary rewriting inside them) before #3561: re-key only those.
+    inline = ({"inline_overrides": 1},) if has_inline_override(span.text) else ()
+    return ((join,) if join else ()) + _emotion_key(span) + inline
 
 
 def _ensure_active_engine_licence() -> None:
@@ -825,12 +831,12 @@ def _chapter_cache_inputs(chapter, sr, engine_id, resolve, cache_dir, lexicon=No
         paragraph_ms = int((opts or ExpressiveOptions()).join_kwargs().get("paragraph_gap_ms") or 0)
         if paragraph_ms > 0:
             from services.chunked_tts import split_paragraphs
-            from services.pronunciation import apply_lexicon
+            from services.pronunciation import apply_lexicon_and_overrides
 
             def gap_spans(span) -> bool:
                 # Same text synthesize_chapter splits: after the lexicon,
                 # which can insert a paragraph break.
-                text = apply_lexicon(span.text, lexicon) if span.text else ""
+                text = apply_lexicon_and_overrides(span.text, lexicon) if span.text else ""
                 return len(split_paragraphs(text)) > 1
 
             gap_sig = f"pausefill={pause_fill}"
@@ -1003,7 +1009,7 @@ async def _run_chapter(chapter, *, default_voice, language, opts, voice_map,
 
     ``on_progress`` is called from the GPU thread after every chunk (#3417)."""
     from services import gpu_gateway
-    from services.model_manager import generate_timeout_s
+    from services.model_manager import await_free_engine, generate_timeout_s
     from services.tts_backend import get_backend_class
     # Resolve and pin every take before rendering starts.  The former routing
     # setup did this even for local jobs; keeping it explicit prevents a
@@ -1024,15 +1030,23 @@ async def _run_chapter(chapter, *, default_voice, language, opts, voice_map,
     except ValueError:
         engine_class = None
     spoken_text = "\n".join(span.text for span in chapter.spans)
-    return await gpu_gateway.run(
-        local=gpu_gateway.LocalCall(
-            fn=lambda: _render_chapter_cached(
-                chapter, synth, sr, engine_id, resolve, cache_dir, lexicon,
-                language, opts, voice_map, cache_lease, on_progress=on_progress,
-            ),
-            what="Audiobook chapter",
-            timeout=generate_timeout_s(spoken_text, engine=engine_class),
-        )
+    budget = generate_timeout_s(spoken_text, engine=engine_class)
+    # A busy engine (a native stream holds it) must not fail the chapter and let
+    # the book assemble without it: wait for it inside the chapter's budget, off
+    # the GPU worker. Each retry resumes from the segments already persisted, so
+    # past the budget the busy error fails this chapter with its real reason.
+    return await await_free_engine(
+        lambda: gpu_gateway.run(
+            local=gpu_gateway.LocalCall(
+                fn=lambda: _render_chapter_cached(
+                    chapter, synth, sr, engine_id, resolve, cache_dir, lexicon,
+                    language, opts, voice_map, cache_lease, on_progress=on_progress,
+                ),
+                what="Audiobook chapter",
+                timeout=budget,
+            )
+        ),
+        budget_s=budget, what="Audiobook engine",
     )
 
 class AudiobookPreviewRequest(ExpressiveMixin):
@@ -1163,12 +1177,13 @@ async def _render_longform_sse(
             except Exception:
                 pass  # best-effort job history
 
-    def _emit(payload: dict, *, persist: bool = True) -> str:
+    def _emit(payload: dict, *, persist: bool = True, completed_chapter: int | None = None) -> str:
         # `progress` events (#3417) are live-only: one per chunk would flood
         # job history, and a reader of it needs only the chapter outcomes.
         if persist and job_store is not None:
             try:
-                job_store.append_event(job_id, json.dumps(payload))
+                job_store.append_event(job_id, json.dumps(payload),
+                                       completed_chapter=completed_chapter)
             except Exception:
                 pass  # best-effort job history; never block the stream
         return f"data: {json.dumps(payload)}\n\n"
@@ -1335,6 +1350,23 @@ async def _render_longform_sse(
                                              include_diagnostic=False)})
                 tracker.finish_chapter(i)
                 yield _progress_event(i)
+                if isinstance(e, TimeoutError) and hasattr(e, "retry_after"):
+                    # The engine stayed busy past the chapter's wait budget (a
+                    # GpuPoolBusyError). Skipping the chapter would mux a book
+                    # with a hole in it: fail the job instead. The manifest and
+                    # the chapters already cached stay, so a retry resumes.
+                    ev = build_failure_event(e, stage="audiobook_render")
+                    ev["reason"] = (f"the speech engine stayed busy; chapter {i + 1} "
+                                    f"was not rendered, so no book was assembled — "
+                                    f"{ev['reason']}")
+                    ev["error"] = ev["reason"]
+                    if job_store is not None:
+                        try:
+                            job_store.mark_failed(job_id, ev["reason"])
+                        except Exception:
+                            pass  # best-effort job history
+                    yield _emit(ev)
+                    return
                 continue
             finally:
                 if not task.done():
@@ -1357,7 +1389,7 @@ async def _render_longform_sse(
                 # reuse inside a re-rendered chapter.
                 ev["segments"] = seg_stats["total"]
                 ev["cached_segments"] = seg_stats["cached"]
-            yield _emit(ev)
+            yield _emit(ev, completed_chapter=i)
             tracker.finish_chapter(i)
             yield _progress_event(i)
 
@@ -1656,18 +1688,12 @@ async def longform_render(req: LongformRenderRequest, request: Request = None):
 
 
 def _chapters_done(job_id: str) -> int:
-    """Count chapters that finished rendering, from the job's persisted events.
+    """Count chapters that finished rendering — the job's durable record, not
+    its capped event tail, so a long book does not stop at 500 (#3562).
     Best-effort (0 if unavailable) — used only to show resume progress."""
     try:
         from core import job_store
-        n = 0
-        for ev in job_store.events_since(job_id, 0, limit=100_000):
-            try:
-                if json.loads(ev["payload"]).get("type") == "chapter":
-                    n += 1
-            except (ValueError, KeyError, TypeError):
-                continue
-        return n
+        return len(job_store.completed_chapters(job_id))
     except Exception:
         return 0
 

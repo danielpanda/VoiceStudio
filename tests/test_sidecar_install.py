@@ -1129,6 +1129,8 @@ def test_uninstalling_one_engine_leaves_every_other_engine_intact(monkeypatch):
         ("dots-tts", ["--python", "3.11"],
          ["-e", "{c}", "-c", "{uri}/constraints/recommended.txt"],
          "OMNIVOICE_DOTS_TTS_DIR"),
+        ("ming-tts", ["--python", "3.10"], ["-r", "{c}/requirements.txt"],
+         "OMNIVOICE_MING_TTS_DIR"),
         # moss-tts-nano installs soundfile alongside the editable install so
         # torchaudio 2.7's I/O backend is present inside this engine's own
         # venv — upstream's pyproject pins torchaudio but no backend
@@ -1221,7 +1223,7 @@ def test_verify_probe_runs_in_the_engines_venv_and_compiles(monkeypatch, engine_
     code = ran[0][2]
     compile(code, "<probe>", "exec")  # a Windows path must not break the literal
     assert "{checkout" not in code
-    if engine_id == "confucius4-tts":
+    if engine_id in ("confucius4-tts", "ming-tts"):
         assert repr(str(checkout)) in code
 
 
@@ -1231,7 +1233,7 @@ def test_verify_probe_runs_in_the_engines_venv_and_compiles(monkeypatch, engine_
 @pytest.mark.parametrize(
     ("family", "platform", "machine", "expected"),
     [
-        ("cuda", "linux", "x86_64", {"moss-tts-v15", "dots-tts", "pockettts", "voxcpm2", "moss-tts-nano", "cosyvoice"}),
+        ("cuda", "linux", "x86_64", {"moss-tts-v15", "ming-tts", "dots-tts", "pockettts", "voxcpm2", "moss-tts-nano", "cosyvoice"}),
         ("cuda", "win32", "AMD64", {"moss-tts-v15", "pockettts", "voxcpm2", "moss-tts-nano", "cosyvoice"}),
         ("cpu", "win32", "AMD64", {"pockettts", "voxcpm2", "moss-tts-nano", "cosyvoice"}),
         ("mps", "darwin", "arm64", {"dots-tts", "pockettts", "voxcpm2", "moss-tts-nano", "cosyvoice"}),
@@ -1369,6 +1371,7 @@ _UPSTREAM_ROOT_FILES = {
     "moss-tts-v15": ("pyproject.toml", "README.md", "LICENSE", "MANIFEST.in"),
     "confucius4-tts": ("requirements.txt", "setup.py", "README.md", "LICENSE", "server.py"),
     "dots-tts": ("pyproject.toml", "README.md", "LICENSE", "constraints/recommended.txt"),
+    "ming-tts": ("requirements.txt", "ming_tts.py", "tts_tasks.py", "README.md", "LICENSE"),
     "moss-tts-nano": ("pyproject.toml", "moss_tts_nano_runtime.py", "requirements.txt",
                       "README.md", "LICENSE"),
     "cosyvoice": ("requirements.txt", "README.md", "LICENSE", "cosyvoice/cli/cosyvoice.py",
@@ -1542,8 +1545,8 @@ def test_rocm_host_installs_rocm_torch_for_indextts2(monkeypatch):
     pip, rocm_index = _capture_rocm_install(monkeypatch, family="rocm")
     # Upstream's cu128 tool.uv.sources must be ignored for torch to resolve.
     assert "--no-sources" in pip
-    assert "torch==2.8.0+rocm6.4" in pip
-    assert "torchaudio==2.8.0+rocm6.4" in pip
+    assert "torch==2.10.0+rocm7.1" in pip
+    assert "torchaudio==2.10.0+rocm7.1" in pip
     i = pip.index("--extra-index-url")
     assert pip[i + 1] == rocm_index
     assert PYTORCH_CU128_INDEX_URL not in pip
@@ -1554,7 +1557,7 @@ def test_rocm_variant_env_opts_in_before_the_family_probe_reports_rocm(monkeypat
     while the main venv swap has not landed yet (family still cpu)."""
     pip, _ = _capture_rocm_install(monkeypatch, family="cpu", variant=" ROCm ")
     assert "--no-sources" in pip
-    assert "torch==2.8.0+rocm6.4" in pip
+    assert "torch==2.10.0+rocm7.1" in pip
 
 
 def test_rocm_torch_never_leaks_to_other_hosts(monkeypatch):
@@ -1598,8 +1601,8 @@ def test_rocm_args_never_reach_engines_without_a_known_torch(monkeypatch):
          "https://download.pytorch.org/whl/rocm6.3"),
         ("confucius4-tts", "torch==2.7.0+rocm6.3", "torchaudio==2.7.0+rocm6.3",
          "https://download.pytorch.org/whl/rocm6.3"),
-        ("indextts2", "torch==2.8.0+rocm6.4", "torchaudio==2.8.0+rocm6.4",
-         "https://download.pytorch.org/whl/rocm6.4"),
+        ("indextts2", "torch==2.10.0+rocm7.1", "torchaudio==2.10.0+rocm7.1",
+         "https://download.pytorch.org/whl/rocm7.1"),
     ],
 )
 def test_rocm_host_gives_each_engine_its_own_torch_version(
@@ -1654,11 +1657,11 @@ def test_rocm_index_env_is_the_index_uv_resolves_against(monkeypatch):
     but the index appended to uv stayed the hard-coded public one — a
     mirror's pins looked up on someone else's server, bypassing the mirror
     a restricted network depends on."""
-    mirror = "https://mirror.example.com/pytorch/rocm6.4"
+    mirror = "https://mirror.example.com/pytorch/rocm7.1"
     monkeypatch.setenv("OMNIVOICE_TORCH_INDEX", mirror)
     pip, public = _capture_rocm_install(monkeypatch, family="rocm")
     assert "--no-sources" in pip
-    assert "torch==2.8.0+rocm6.4" in pip  # tag still from the mirror's tail
+    assert "torch==2.10.0+rocm7.1" in pip  # tag still from the mirror's tail
     assert mirror in pip
     assert public not in pip
 

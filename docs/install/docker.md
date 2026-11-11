@@ -6,7 +6,7 @@ it in a normal browser. It is built from the same maintained renderer as the
 Electron desktop app; controls that require native desktop access are hidden.
 
 Inference runs inside the container. Nothing is sent off the machine without
-your explicit yes: product analytics are opt-in (PostHog, content-free usage
+your explicit yes: product analytics are opt-in (Supermetry, content-free usage
 metadata only) behind the same first-run consent prompt as the desktop app,
 and declining or skipping it keeps them off. Set
 `-e OMNIVOICE_ANALYTICS_DISABLED=1` to switch analytics off entirely. Model
@@ -136,9 +136,8 @@ docker run -d --name omnivoice --gpus all \
 ```
 
 It needs the NVIDIA Container Toolkit and a driver that supports CUDA 12.9.
-The image is built from Ubuntu 24.04 with PyTorch 2.8.0 for CUDA 12.9 (PyTorch
-publishes no CUDA 12.8 build of 2.8.0 for aarch64), on GitHub's native arm64
-runners. Differences from the x86-64 CUDA image:
+The image is built from Ubuntu 24.04 with PyTorch 2.10.0 for CUDA 12.9 on
+GitHub's native arm64 runners. Differences from the x86-64 CUDA image:
 
 - CTranslate2-based ASR engines (faster-whisper, WhisperX) report unavailable:
   NVIDIA ships no aarch64 build of the cuDNN 8 libraries they need. Use

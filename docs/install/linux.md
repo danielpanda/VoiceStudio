@@ -40,6 +40,12 @@ microphone interface; if VoiceStudio cannot hear you, connect it once:
 sudo snap connect voicestudio:audio-record
 ```
 
+The snap runs through XWayland by default because native Wayland crashed it on
+some GNOME releases. To try native Wayland, launch it with
+`VOICESTUDIO_SNAP_OZONE_PLATFORM=wayland voicestudio`; on a revision built by
+Snapcraft Builds the variable is not read, so use
+`voicestudio --ozone-platform=wayland` instead.
+
 <a id="install-appimage"></a>
 
 Download a package from the
@@ -62,15 +68,27 @@ The [shell installer](script.md) (`curl -fsSL https://voicestudio.sh/install | s
 downloads the latest AppImage, verifies it against the release's
 `SHA256SUMS.txt`, and installs it as `~/.local/bin/VoiceStudio`.
 
+Current builds include the unified terminal command. Debian packages expose
+`voicestudio` through `/usr/bin` and the shell installer through `~/.local/bin`.
+A downloaded AppImage links `~/.local/bin/voicestudio` on first launch and, if
+your shell does not already search `~/.local/bin`, adds it to your shell profile
+once. Open a new terminal afterwards. `voicestudio` opens
+the app, and commands start it in the background when it is not running; no
+separate Python installation is needed. Existing custom launchers are not
+replaced; see [Terminal command](script.md#terminal-command).
+The .deb also keeps the pre-rename `voicestudio-electron` command as a link to
+`voicestudio`, so existing scripts keep working.
+
 **.deb:**
 
 ```bash
 sudo apt install ./VoiceStudio-<version>-linux-x64.deb
 ```
 
-The in-app updater's Linux feed carries the AppImage. Update a `.deb`
-installation by installing the newer `.deb`; remove it with your package
-manager.
+The in-app updater's Linux feed carries the AppImage, which installs a
+downloaded update when you quit. A `.deb` installation never installs on quit
+(that needs an administrator prompt); update it with **Restart** in the app or
+by installing the newer `.deb`, and remove it with your package manager.
 
 Compare any download with the release's `SHA256SUMS.txt` before installing.
 
@@ -120,8 +138,12 @@ Prerequisites:
   sudo pacman -S --needed base-devel alsa-lib xdotool libxtst libx11 libxkbcommon wayland openssl
   ```
 
-  `bun run dist` also needs `readelf` (binutils) and `zsyncmake` (zsync) to
-  embed AppImage update information.
+  `bun run dist` also needs `readelf` (binutils) and `zsyncmake` (part of the
+  `zsync` package) to embed AppImage update information.
+
+  The dictation helper links the shared `libxdo` (through `enigo`'s default
+  `xdo` feature). nixpkgs' `xdotool` ships no shared `libxdo`, so the Nix flake
+  builds it — see [Nix / NixOS](#nix--nixos) below.
 
 Then, from a clone of the repository:
 
@@ -176,12 +198,19 @@ installs. Model and Python runtime setup remain explicit in the app.
 
 ### Nix / NixOS
 
-A community-maintained Nix flake provides development shells and an FHS environment for running from source (not tested in CI). See the [Nix / NixOS guide](nix.md):
+A community-maintained Nix flake (built by a non-blocking CI check) provides development shells,
+an FHS environment for NixOS and a Nix-built Linux x64 app. See the
+[Nix / NixOS guide](nix.md):
 
 ```bash
-nix develop .#fhs   # recommended for NixOS
+nix develop .#fhs   # recommended for NixOS; `nix develop` for the plain shell
 bun run dev
 ```
+
+`nix run .` launches the Nix-built app from a checkout. Its first run installs
+uv's managed Python like the AppImage does, which on NixOS needs
+[nix-ld](https://github.com/nix-community/nix-ld). Its launcher sets
+`VOICESTUDIO_DISABLE_UPDATER=1`; update it with Nix.
 
 ## ChromeOS, iPad and other devices
 
@@ -257,7 +286,9 @@ process errors, start the app once with Chromium's GPU acceleration disabled:
 
 On Wayland sessions you can also try forcing X11 (XWayland) with
 `--ozone-platform=x11`. If either flag helps, report your distribution, desktop
-and GPU driver in a GitHub issue.
+and GPU driver in a GitHub issue. Other Chromium or Electron switches given to
+the AppImage, or to `voicestudio` without a command, also go to the app, except
+the command's own options such as `--version` and `--help`, which it runs itself.
 
 ## .deb ffprobe conflict
 
@@ -315,7 +346,7 @@ on CPU until you opt into the ROCm variant.
 > setup; see [windows-rocm.md](windows-rocm.md).
 
 **Radeon RX 9000 series (RDNA4: RX 9060 / 9070 / 9070 XT, `gfx1200`/`gfx1201`)**
-is supported natively by the ROCm build below (torch 2.8.0 from the `rocm6.4`
+is supported natively by the ROCm build below (torch 2.10.0 from the `rocm7.1`
 index includes both architectures), so it needs no `HSA_OVERRIDE_GFX_VERSION`.
 The host needs an `amdgpu` kernel driver new enough for RDNA4 (AMD's ROCm
 6.4.1+ driver, or a recent distribution kernel); `rocminfo` listing your card
@@ -332,8 +363,8 @@ Once setup finishes, the choice is saved in `~/.config/omnivoice/env`, so later
 launches and app updates keep ROCm without the variable. To leave ROCm, launch
 once with `OMNIVOICE_TORCH_VARIANT=cpu`.
 Runtime setup then reinstalls `torch`/`torchaudio`/`torchvision` from the ROCm
-wheel index (`https://download.pytorch.org/whl/rocm6.4` by default) right after
-the dependency sync, leaving every other package on the regular index, matched to the app's pinned `torch==2.8.0` (the rocm6.2 index
+wheel index (`https://download.pytorch.org/whl/rocm7.1` by default) right after
+the dependency sync, leaving every other package on the regular index, matched to the app's pinned `torch==2.10.0` (the rocm6.2 index
 only ever published up to torch 2.5.1). **Settings → Performance → GPU
 acceleration** reports which PyTorch build is installed. The option is ignored
 on macOS; on Windows it selects the opt-in stack in
@@ -350,7 +381,7 @@ publishes newer driver-matched 7.2.x wheels on `repo.radeon.com` as a
 `--find-links` page rather than a PyPI-compatible index, for example:
 ```bash
 uv pip install --reinstall-package torch --reinstall-package torchaudio \
-  --reinstall-package torchvision torch==2.8.0 torchaudio==2.8.0 torchvision==0.23.0 \
+  --reinstall-package torchvision torch==2.10.0 torchaudio==2.10.0 torchvision==0.25.0 \
   --find-links https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/
 ```
 run that manually if you want a specific ROCm point release; the
@@ -363,16 +394,16 @@ keeps the default torch build and warns instead of breaking the install.
 
 ```bash
 # From the project directory (source install), into VoiceStudio's uv venv.
-# Matches the app's torch==2.8.0 pin — a different ROCm point release
-# (e.g. rocm6.2, rocm7.x) may not carry that exact torch build.
+# Matches the app's torch==2.10.0 pin — a different ROCm point release
+# (e.g. rocm6.4, rocm7.2) may not carry that exact torch build.
 # Swap all three torch packages together: a CUDA torchvision left beside a
 # ROCm torch fails at generation time ("operator torchvision::nms does not
 # exist"). Keep PyPI as the main index: PyTorch's index has no Pillow 13, so
 # `--index-url` with `--reinstall` cannot resolve (#3158).
 uv pip install \
   --reinstall-package torch --reinstall-package torchaudio --reinstall-package torchvision \
-  torch==2.8.0+rocm6.4 torchaudio==2.8.0+rocm6.4 torchvision==0.23.0+rocm6.4 \
-  --extra-index-url https://download.pytorch.org/whl/rocm6.4 \
+  torch==2.10.0+rocm7.1 torchaudio==2.10.0+rocm7.1 torchvision==0.25.0+rocm7.1 \
+  --extra-index-url https://download.pytorch.org/whl/rocm7.1 \
   --index-strategy unsafe-best-match
 ```
 

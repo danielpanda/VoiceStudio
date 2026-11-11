@@ -50,11 +50,14 @@ GET /api/settings/llm-providers
 GET /api/settings/llm-providers/{provider_id}/models
 GET /api/settings/llm-skills
 GET /api/settings/pause-fill
+GET /api/settings/perf/gguf-resident
 GET /api/settings/perf/offload-after-generation
 GET /api/settings/perf/torch-compile-disabled
 GET /api/settings/performance-profile
 GET /api/settings/storage
 GET /api/settings/storage/models-dir
+GET /api/settings/video-export
+GET /api/sfx/status
 GET /archetypes
 GET /archetypes/categories
 GET /archetypes/previews/status
@@ -169,6 +172,7 @@ GET /setup/status
 GET /startup/progress
 GET /stats/usage
 GET /sysinfo
+GET /system/activity
 GET /system/asr-backends
 GET /system/diagnose
 GET /system/errors/recent
@@ -204,6 +208,7 @@ POST /api/cloud-sync/start
 POST /api/cloud-sync/stop
 POST /api/cloud-sync/use-choices-of/{device_id}
 POST /api/integrations/twilio/test
+POST /api/settings/analytics/event
 POST /api/settings/asr-openai-compat/test
 POST /api/settings/engines/{family}/{engine_id}/local-model/discover
 POST /api/settings/hf-mirror/test
@@ -213,6 +218,7 @@ POST /api/settings/llm-providers/active
 POST /api/settings/llm-providers/{provider_id}/connect
 POST /api/settings/llm-providers/{provider_id}/test
 POST /api/settings/storage/temp/clear
+POST /api/sfx/generate
 POST /archetypes/previews/check
 POST /archetypes/{archetype_id}/use
 POST /audiobook
@@ -353,10 +359,12 @@ PUT /api/settings/llm-endpoint
 PUT /api/settings/llm-providers/{provider_id}
 PUT /api/settings/llm-skills/{skill_id}
 PUT /api/settings/pause-fill
+PUT /api/settings/perf/gguf-resident
 PUT /api/settings/perf/offload-after-generation
 PUT /api/settings/perf/torch-compile-disabled
 PUT /api/settings/performance-profile
 PUT /api/settings/storage/models-dir
+PUT /api/settings/video-export
 PUT /archetypes/previews
 PUT /calls/settings
 PUT /glossary/{project_id}/{term_id}

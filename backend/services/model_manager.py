@@ -562,6 +562,36 @@ class GpuPoolBusyError(TimeoutError):
         self.retry_after = max(1, int(round(retry_after)))
 
 
+BUSY_BACKOFF_S = (0.5, 1.0, 2.0, 4.0)
+
+
+async def await_free_engine(call, *, budget_s, is_cancelled=None, backoff=BUSY_BACKOFF_S,
+                            what="engine"):
+    """Await ``call()``; while the engine is busy (:class:`GpuPoolBusyError`: a
+    native stream holds it, or the pool queue is saturated), wait and retry with
+    backoff inside ``budget_s``, stopping as soon as ``is_cancelled()``.
+
+    The wait runs on the event loop, never inside a GPU worker. A busy engine
+    must never become a silent or missing piece of an assembled output: past the
+    budget (or once cancelled) the busy error propagates so the job fails
+    clearly. ``call`` must be safe to repeat (busy means no work was lost)."""
+    deadline = time.monotonic() + budget_s
+    attempt = 0
+    while True:
+        try:
+            return await call()
+        except GpuPoolBusyError as busy:
+            remaining = deadline - time.monotonic()
+            if (is_cancelled is not None and is_cancelled()) or remaining <= 0:
+                raise
+            delay = min(backoff[min(attempt, len(backoff) - 1)], remaining)
+            attempt += 1
+            logger.info("%s busy (%s); retrying in %.1fs", what, busy, delay)
+            await asyncio.sleep(delay)
+            if (is_cancelled is not None and is_cancelled()) or time.monotonic() >= deadline:
+                raise
+
+
 def _explicit_budget_flags() -> "tuple[bool, bool]":
     """(universal_explicit, cpu_explicit): is the accelerated / CPU budget set
     by the user (env, or changed at runtime)? The single definition shared by
@@ -1581,8 +1611,8 @@ def _rocm_arch_remedy(device_arch: str, arch_list) -> str:
 
     install = (
         f"Install a ROCm PyTorch build that lists {device_arch}: "
-        "OMNIVOICE_TORCH_VARIANT=rocm setup installs torch 2.8.0 from the "
-        "rocm6.4 index, which includes gfx1200/gfx1201 (RX 9000 series)."
+        "OMNIVOICE_TORCH_VARIANT=rocm setup installs torch 2.10.0 from the "
+        "rocm7.1 index, which includes gfx1200/gfx1201 (RX 9000 series)."
     )
     if "HSA_OVERRIDE_GFX_VERSION" in device_arch:
         return "Remove or correct HSA_OVERRIDE_GFX_VERSION, or " + install[0].lower() + install[1:]
@@ -1635,6 +1665,10 @@ def check_device_compatibility():
             f"PyTorch build. Supported architectures: {', '.join(arch_list)}. "
             + _rocm_arch_remedy(device_arch, arch_list)
         )
+    from core.device_caps import is_legacy_nvidia_arch, legacy_nvidia_advice
+
+    if is_legacy_nvidia_arch(device_arch):
+        return False, legacy_nvidia_advice(device_name, device_arch)
     return False, (
         f"{device_name} ({device_arch}) is not supported by this PyTorch build. "
         f"Supported architectures: {', '.join(arch_list)}. "
@@ -3658,7 +3692,9 @@ async def run_release(fn, *args):
 def _release_idle_model() -> None:
     """Unload the idle shared model; a failure must not end the idle reaper."""
     try:
-        unload_shared_model()
+        # A native extension or library calling sys.exit() during the unload
+        # would otherwise end the whole backend silently (#3887).
+        contain_system_exit(unload_shared_model, "idle model unload")()
     except Exception:  # noqa: BLE001 — the reaper must never kill idle_worker
         logger.warning("idle model unload failed", exc_info=True)
 
@@ -3679,12 +3715,25 @@ def _release_idle_side_models(idle_timeout: float) -> None:
             release_transcription_backend,
         )
 
-        released = release_idle_capture_backend(idle_timeout)
-        # The warm transcription ASR gets the same idle bargain.
-        if release_transcription_backend(idle_timeout) or released:
-            free_vram()
+        def _release_asr():
+            released = release_idle_capture_backend(idle_timeout)
+            # The warm transcription ASR gets the same idle bargain.
+            if release_transcription_backend(idle_timeout) or released:
+                free_vram()
+
+        contain_system_exit(_release_asr, "idle capture-ASR release")()
     except Exception:  # noqa: BLE001 — the reaper must never kill idle_worker
         logger.warning("idle capture-ASR release failed", exc_info=True)
+    # Engines that keep a model server between requests (the opt-in OmniVoice
+    # GGUF resident server) hold VRAM in a child process the paths above never see.
+    try:
+        from services.tts_backend import release_idle_resident_servers
+
+        contain_system_exit(
+            lambda: release_idle_resident_servers(idle_timeout), "idle resident-server release"
+        )()
+    except Exception:  # noqa: BLE001 — the reaper must never kill idle_worker
+        logger.warning("idle resident-server release failed", exc_info=True)
     # Same bargain for the AudioSeal watermark models, which loaded on the
     # first embed and were never released. Deliberately only here and not
     # in the make-room paths: watermarking runs immediately *after* a
@@ -3692,7 +3741,9 @@ def _release_idle_side_models(idle_timeout: float) -> None:
     try:
         from services.watermark import release_idle_models
 
-        release_idle_models(idle_timeout)
+        contain_system_exit(
+            lambda: release_idle_models(idle_timeout), "idle watermark-model release"
+        )()
     except Exception:  # noqa: BLE001 — the reaper must never kill idle_worker
         logger.warning("idle watermark-model release failed", exc_info=True)
 

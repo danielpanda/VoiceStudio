@@ -3,6 +3,7 @@ import { windowsRocmInstalled, windowsRocmRequested } from './runtime-windows-ro
 import { runtimeProjectReady } from './runtime-readiness';
 import { cpuSetupOffered, rememberTorchVariant, saveTorchVariant } from './torch-choice';
 import { runRuntimeProbe } from './runtime-probe';
+import { needsManagedRuntime, selectedPythonPath, validatePythonRuntime } from './runtime-python-selection';
 import { RuntimeLaunchRefusedError } from './runtime-launch-refusal';
 import { pypiFilesHost } from './pypi-mirror';
 import { SetupLog, scrubSetupText } from './setup-log';
@@ -26,6 +27,7 @@ import {
   type RuntimeRegion,
   runtimeRequiredGib,
 } from './runtime-project';
+import { detectSetupHardware, type SetupHardware } from './setup-hardware';
 import { collectHostSnapshot, freeGb, type HostSnapshot } from './host-snapshot';
 import { collectTrustFacts, programBasename, runProbe, type TrustFacts } from './install-doctor';
 import {
@@ -88,7 +90,11 @@ import {
   type RemoteSession,
 } from './remote-backend';
 import { toolSearchDirs, toolSearchDirsAsync } from './tool-path';
-import { SetupProgressTracker, cleanProcessLine } from './setup-progress';
+import {
+  SetupProgressTracker,
+  cleanProcessLine,
+  downloadStallExceeded,
+} from './setup-progress';
 import { SetupDownloadReporter, inFlightDownloadBytes } from './setup-downloads';
 import { scrubText } from '../shared/utils/scrub';
 import { DEFAULT_BACKEND_PORT } from '../../../config/app-config.mjs';
@@ -569,6 +575,22 @@ export async function resolveSpawnPlan(
   }
   const override = parseBackendCmdOverride(process.env.OMNIVOICE_BACKEND_CMD);
   if (override) return { argv: override, cwd: root };
+  const selectedPython = selectedPythonPath();
+  if (selectedPython) {
+    // The external interpreter uses bundled sources; no managed project exists yet.
+    const project = root;
+    const validation = await validatePythonRuntime(selectedPython, project);
+    if (!validation.ok) {
+      const missing = validation.missingModules?.length
+        ? ` Missing modules: ${validation.missingModules.join(', ')}.`
+        : '';
+      return {
+        error: `The selected Python runtime is not compatible${validation.version ? ` (Python ${validation.version})` : ''}.${missing} ${validation.detail ?? 'Validation failed.'} Select another interpreter or return to the managed runtime.`,
+      };
+    }
+    // -B: never write bytecode into the app's bundled sources.
+    return { argv: [selectedPython, '-B', '-m', ...UVICORN_ARGS, '--port', String(port)], cwd: project };
+  }
   if (app.isPackaged) {
     const project = packagedProject ?? join(defaultRuntimeRoot(), 'project');
     // Heals runtimes installed before #1783 was fixed without a repair run.
@@ -624,6 +646,9 @@ export async function resolveSpawnPlan(
   // Name the import that failed (#2555): "incomplete" alone cannot tell a
   // setup that never ran from one that finished but cannot load a module.
   let failure = '';
+  // A source checkout under a non-ASCII folder gets the same #1783 healing as an
+  // installed runtime: each `uv sync` rewrites the editable .pth with that path.
+  await asciiSafePthFiles(join(root, '.venv')).catch(() => []);
   if (devProbeStamped(root, python)) {
     return { argv: [python, '-m', ...UVICORN_ARGS, ...portArg], cwd: root };
   }
@@ -670,13 +695,6 @@ function childEnv(
       }
     }
   }
-  const packagedToken =
-    typeof __POSTHOG_PROJECT_TOKEN__ === 'string' ? __POSTHOG_PROJECT_TOKEN__ : '';
-  const packagedHost = typeof __POSTHOG_HOST__ === 'string' ? __POSTHOG_HOST__ : '';
-  if (packagedToken && !env.POSTHOG_PROJECT_TOKEN) {
-    env.POSTHOG_PROJECT_TOKEN = packagedToken;
-  }
-  if (packagedHost && !env.POSTHOG_HOST) env.POSTHOG_HOST = packagedHost;
   // The backend reports the same build commit as the app in bug reports.
   if (!env.OMNIVOICE_BUILD_COMMIT && __BUILD_COMMIT__ !== 'unknown') {
     env.OMNIVOICE_BUILD_COMMIT = __BUILD_COMMIT__;
@@ -876,6 +894,26 @@ export interface BackendLaunchLog {
   /** The child's working directory: a relative data dir is relative to it. */
   cwd: string;
   startedAt: number;
+}
+
+const EXIT_TAIL_LINES = 20;
+const EXIT_TAIL_LINE_CHARS = 300;
+const EXIT_TAIL_CHARS = 3000;
+
+/**
+ * The backend's last stderr lines for an unexpected-exit message (#3887): a
+ * silent exit left only one line to go on. The ring was scrubbed when each
+ * line arrived; the tail is bounded by line count, line width and total size
+ * so the report stays small. Empty when there is nothing to add.
+ */
+export function stderrTail(ring: readonly string[]): string {
+  const lines = ring
+    .slice(-EXIT_TAIL_LINES)
+    .map((line) => line.trimEnd().slice(0, EXIT_TAIL_LINE_CHARS))
+    .filter(Boolean);
+  if (lines.length < 2) return '';
+  const body = lines.join('\n');
+  return `\nLast stderr:\n${body.length > EXIT_TAIL_CHARS ? body.slice(-EXIT_TAIL_CHARS) : body}`;
 }
 
 /** The quoted log evidence, scrubbed and bounded. */
@@ -1113,6 +1151,10 @@ export class BackendSupervisor extends EventEmitter<{
   private diagnosis: BackendStatus['diagnosis'];
   private setupIssue: BackendStatus['setupIssue'];
   private setupRequiredGib: number | undefined;
+  private setupHardware: SetupHardware | undefined;
+  private setupHardwareProbed = false;
+  /** Bumped when the torch choice changes, so an in-flight probe cannot write a stale build. */
+  private setupHardwareGeneration = 0;
   /** Free GiB on the drive that will hold the runtime; probed once per location during setup. */
   private runtimeFreeGib: number | undefined;
   private freeProbeRoot: string | undefined;
@@ -1277,6 +1319,20 @@ export class BackendSupervisor extends EventEmitter<{
       status.setupRequiredGib = this.setupRequiredGib ?? runtimeRequiredGib();
     if (this.stage === 'setup_required' && app.isPackaged && this.runtimeFreeGib !== undefined)
       status.runtimeFreeGib = this.runtimeFreeGib;
+    if (this.stage === 'setup_required' && app.isPackaged) {
+      if (!this.setupHardwareProbed) {
+        this.setupHardwareProbed = true;
+        const generation = this.setupHardwareGeneration;
+        void detectSetupHardware().then((found) => {
+          if (generation !== this.setupHardwareGeneration) return;
+          this.setupHardware = found;
+          // The setup screen may be idle with no other status change coming;
+          // publish once so the hardware line appears as soon as it is known.
+          if (found && this.stage === 'setup_required') this.emitStatus();
+        });
+      }
+      if (this.setupHardware && !this.setupIssue) status.setupHardware = this.setupHardware;
+    }
     if (this.stage === 'setup_required' && this.runtimeInterrupted)
       status.runtimeInterrupted = true;
     if (this.stage === 'setup_required' && this.runtimeRepairFailed)
@@ -1356,6 +1412,15 @@ export class BackendSupervisor extends EventEmitter<{
         return;
       }
 
+      // A terminal or another shell can own a backend whose early-bind
+      // health endpoint is still starting. Wait for that owner instead of
+      // staging its sources or launching a competing process.
+      if (await this.probe(this.baseUrl, true)) {
+        if (gen !== this.generation) return;
+        void this.waitUntilReady(gen, startupBudgetMs());
+        return;
+      }
+
       // A previous fallback is only useful while its backend still answers.
       // Once it is gone, retry the configured endpoint before spawning anew.
       if (this.localPort !== this.configuredPort) {
@@ -1370,9 +1435,12 @@ export class BackendSupervisor extends EventEmitter<{
       }
 
       if (
-        app.isPackaged &&
-        runtimeSetupSupported() &&
-        !parseBackendCmdOverride(process.env.OMNIVOICE_BACKEND_CMD)
+        needsManagedRuntime(
+          app.isPackaged,
+          runtimeSetupSupported(),
+          selectedPythonPath(),
+          Boolean(parseBackendCmdOverride(process.env.OMNIVOICE_BACKEND_CMD)),
+        )
       ) {
         const { project, ready } = await this.resolveRuntimeProject();
         if (!ready) {
@@ -1616,22 +1684,48 @@ export class BackendSupervisor extends EventEmitter<{
               return;
             }
             this.child = child;
+            this.setupProgress.restartStallClock();
+            let stallError: Error | undefined;
+            // uv waits 900 s on a silent socket; stop it sooner so the retry can start (#3950).
+            const stallWatch = setInterval(() => {
+              const snapshot = this.setupProgress.snapshot();
+              if (stallError || !downloadStallExceeded(snapshot)) return;
+              stallError = Object.assign(
+                new Error(
+                  `Download timed out: no data for ${snapshot.stalledSeconds} s from ${snapshot.downloadHost ?? 'the download server'}`,
+                ),
+                { code: 'DOWNLOAD_STALLED' },
+              );
+              this.pushLog('err', stallError.message);
+              // Not a backend shutdown: setup's uv has no server to tell.
+              void this.killChild();
+            }, 5_000);
             let capturedStdout = '';
+            let capturedStderr = '';
+            child.stderr?.on('data', (chunk: Buffer | string) => {
+              capturedStderr = (capturedStderr + chunk.toString()).slice(-8_192);
+            });
             child.stdin?.on('error', () => {});
             child.stdout?.on('data', (chunk: Buffer | string) => {
               capturedStdout = (capturedStdout + chunk.toString()).slice(-65_536);
             });
             this.attachLineReader(child.stdout, 'out');
             this.attachLineReader(child.stderr, 'err');
-            child.on('error', launchFailed);
+            child.on('error', (err) => {
+              clearInterval(stallWatch);
+              launchFailed(err);
+            });
             child.on('close', (code) => {
+              clearInterval(stallWatch);
               if (this.child === child) this.child = null;
-              if (code === 0) resolve(capturedStdout);
+              if (stallError) reject(stallError);
+              else if (code === 0) resolve(capturedStdout);
               else
                 reject(
                   Object.assign(new Error(`Runtime setup exited with code ${code}`), {
                     code,
                     stdout: capturedStdout,
+                    stderr: capturedStderr,
                   }),
                 );
             });
@@ -1779,6 +1873,10 @@ export class BackendSupervisor extends EventEmitter<{
       return;
     }
     process.env.OMNIVOICE_TORCH_VARIANT = 'cpu';
+    // The setup screen names the build it will install; detect it again.
+    this.setupHardware = undefined;
+    this.setupHardwareProbed = false;
+    this.setupHardwareGeneration += 1;
     if (!saveTorchVariant('cpu'))
       this.setupLog.append('Could not save the CPU choice; the next launch may ask again');
     await this.start();
@@ -2402,7 +2500,7 @@ export class BackendSupervisor extends EventEmitter<{
       managed: true,
       message: startup
         ? `Backend failed to start during '${startup.step}' (${why}): ${startup.reason}`
-        : `Backend exited unexpectedly (${why}).${lastLine ? ` Last output: ${lastLine}` : ''}`,
+        : `Backend exited unexpectedly (${why}).${lastLine ? ` Last output: ${lastLine}` : ''}${stderrTail(this.childErrorLog)}`,
     });
   }
 

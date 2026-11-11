@@ -29,6 +29,26 @@ const mocks = vi.hoisted(() => ({
   hosts: vi.fn(async () => new Map<string, string>()),
 }));
 vi.mock('electron', () => ({ app: { isPackaged: true, getPath: () => '/private/voicestudio' } }));
+// The setup screen's hardware line follows the torch choice in the environment.
+// Probes stay pending until a test settles them, so a race can be ordered.
+const hardwareProbes = vi.hoisted(
+  () => [] as { variant: string | undefined; resolve: (value: unknown) => void }[],
+);
+vi.mock('./setup-hardware', () => ({
+  detectSetupHardware: () =>
+    new Promise((resolve) =>
+      hardwareProbes.push({ variant: process.env.OMNIVOICE_TORCH_VARIANT, resolve }),
+    ),
+}));
+/** Settles pending probes newest first, so an older (stale) result lands last. */
+function settleHardwareProbes() {
+  for (const probe of hardwareProbes.splice(0).reverse())
+    probe.resolve(
+      probe.variant === 'cpu'
+        ? { build: 'cpu', reason: 'explicit' }
+        : { gpu: 'NVIDIA Test GPU', build: 'cuda' },
+    );
+}
 vi.mock('node:child_process', () => ({ spawn: mocks.spawn, spawnSync: vi.fn() }));
 vi.mock('node:fs', async (importOriginal) => {
   const original = await importOriginal<typeof import('node:fs')>();
@@ -201,6 +221,38 @@ it('keeps setup status readable for Windows ARM64 with an unsupported ROCm overr
   }
 });
 
+it('waits for a terminal-owned backend during startup without spawning or staging', async () => {
+  vi.useFakeTimers();
+  vi.stubEnv('VOICESTUDIO_SKIP_BACKEND', '');
+  let ready = false;
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(
+      async () =>
+        new Response(JSON.stringify({ status: ready ? 'ok' : 'starting', version: 'test' }), {
+          status: ready ? 200 : 503,
+          headers: { 'x-omnivoice-backend': 'test' },
+        }),
+    ),
+  );
+  const supervisor = new BackendSupervisor();
+  try {
+    await supervisor.start();
+    expect(supervisor.status.stage).toBe('attaching');
+    expect(mocks.spawn).not.toHaveBeenCalled();
+    expect(mocks.stage).not.toHaveBeenCalled();
+    ready = true;
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(supervisor.status.stage).toBe('ready');
+    expect(supervisor.status.managed).toBe(false);
+    await supervisor.shutdown();
+    expect(mocks.spawn).not.toHaveBeenCalled();
+  } finally {
+    await supervisor.shutdown();
+    vi.useRealTimers();
+  }
+});
+
 it('publishes packaged startup preflight failures instead of rejecting startup', async () => {
   vi.stubGlobal(
     'fetch',
@@ -232,14 +284,6 @@ it('passes a live nested-operation drain descriptor to POSIX managed backends', 
   expect(windows.drainFd).toBeNull();
   expect(windows.stdio).toEqual(['pipe', 'pipe', 'pipe']);
   expect(windows.env.OMNIVOICE_DESKTOP_DRAIN_FD).toBeUndefined();
-});
-
-it('passes the packaged analytics destination to its managed backend', () => {
-  vi.stubGlobal('__POSTHOG_PROJECT_TOKEN__', 'publishable-test-key');
-  vi.stubGlobal('__POSTHOG_HOST__', 'https://us.i.posthog.com');
-  const { env } = managedBackendSpawnOptions(3900);
-  expect(env.POSTHOG_PROJECT_TOKEN).toBe('publishable-test-key');
-  expect(env.POSTHOG_HOST).toBe('https://us.i.posthog.com');
 });
 
 it('recognizes only expected child-pipe close errors', () => {
@@ -1117,6 +1161,11 @@ describe('falling back to the CPU build', () => {
 
     expect(variants.at(-1)).toBe('cpu');
     expect(mocks.saveTorchVariant).toHaveBeenCalledWith('cpu');
+    // The CPU attempt failed too; the next retry installs CPU, so say so, even
+    // when the probe started for the CUDA attempt finishes after the switch.
+    void supervisor.status;
+    settleHardwareProbes();
+    await vi.waitFor(() => expect(supervisor.status.setupHardware?.build).toBe('cpu'));
   });
 
   it('stops a stuck download first, so the CPU install can start', async () => {
