@@ -83,6 +83,18 @@ The runtime folder is on a drive mounted with `noexec`. Choose a folder on anoth
 
 A runtime download received no data for a long time. Setup stops a download that gets no data for 2 minutes, and repeats the install up to twice by itself after a stall or a temporary server error (such as 504 Gateway Timeout) before it shows this. Retry keeps finished packages and resumes large multi-connection downloads, but other partial downloads start again. Try another network, turn off your VPN or choose another download region.
 
+Cancel and Restart on CPU interrupt the automatic retry countdown immediately;
+finished downloads remain cached. Runtime probes also drain verbose diagnostic
+output even when it is not being captured, so a full output pipe cannot block
+an otherwise successful check.
+
+Retry reuses completed, hash-verified prefetched wheels before budgeting space
+for new downloads. Already downloaded wheels are not counted a second time;
+new transfers still leave the required installation-space reserve available.
+Wheel-size probes also handle a connection reset or timeout after response
+headers arrive. Download consumers still receive stream errors, and an
+interrupted wheel is kept incomplete rather than published as a finished file.
+
 ### `RUNTIME_DOWNLOAD_INTERRUPTED`
 
 The connection dropped during a runtime download, as in `peer closed connection without sending TLS close_notify`. Retry keeps finished packages and resumes large multi-connection downloads, but other partial downloads start again. The same advice as `RUNTIME_DOWNLOAD_STALLED` applies if it repeats.
@@ -121,15 +133,21 @@ The managed Python environment is damaged and automatic repair did not fix it. U
 
 ### `NATIVE_ACCESS_VIOLATION`
 
-The engine crashed below Python (`0xC0000005` or `SIGSEGV`). Update your GPU driver and try CPU mode. Send the in-app report if it persists.
+The engine crashed below Python (`0xC0000005` or `SIGSEGV`). Update your GPU driver and try CPU mode. Send the in-app report if it persists. On Windows the report names the library that crashed (see [Native backend crashes in Electron](#native-backend-crashes-in-electron)); when it is the graphics driver, the screen says so.
+
+A crash inside the model weight loader (`transformers/core_model_loading.py` in the crashed thread, seen on some Windows machines) is avoided on Windows by default: the backend loads weights one at a time (`HF_DEACTIVATE_ASYNC_LOAD=1`), which only makes loading slower. Set `HF_DEACTIVATE_ASYNC_LOAD=0` to opt back in to threaded loading. On macOS and Linux the same setting is applied automatically, for later starts of the same version, after such a crash.
 
 ### `NATIVE_ILLEGAL_INSTRUCTION`
 
-The engine hit an instruction this computer could not run (`0xC000001D` or `SIGILL`). The processor may lack a feature its libraries need. Send the in-app report with your processor model.
+The engine hit an instruction this computer could not run (`0xC000001D` or `SIGILL`). The processor may lack a feature its libraries need, or a driver stopped on purpose. Send the in-app report with your processor model. On Windows it names the library that stopped.
+
+### `NATIVE_IN_PAGE_ERROR`
+
+Windows could not read part of a file the engine had mapped into memory (`0xC0000006 STATUS_IN_PAGE_ERROR`), usually a model file. The most common cause is a disk or paging-file read error; a failed write to a mapped file or memory pressure can also raise it, so the code alone does not rule out a defect. Keep VoiceStudio and its models on an internal drive (not a USB, network or sleeping external drive), check that drive for errors (`chkdsk`), and let Windows manage the paging file size. Then retry, and send the in-app report if it keeps happening on a healthy drive.
 
 ### `NATIVE_CRASH`
 
-The engine crashed below Python with another native fault. Send the in-app report: it carries the exit code.
+The engine crashed below Python with another native fault, such as `0xC0000374 STATUS_HEAP_CORRUPTION` or `0xC0000409 STATUS_STACK_BUFFER_OVERRUN`. Send the in-app report: it carries the exit code and, on Windows, the library that crashed.
 
 ### `STARTUP_TIMEOUT_SILENT`
 
@@ -939,11 +957,25 @@ did was `generate:start (audio)`, a dub, or a dictation.
 Newer builds **bound** every GPU job — whole-file transcription, **chunked dub
 transcription**, **and** TTS generation: instead of hanging forever and starving
 the backend, a wedged job fails after a timeout with this exact guidance. Tune
-the bounds with `OMNIVOICE_ASR_TRANSCRIBE_TIMEOUT_S` (whole-file transcription)
-and `OMNIVOICE_GENERATE_TIMEOUT_S` (generation) — both in seconds, default 300
-— and `OMNIVOICE_TRANSCRIBE_CHUNK_TIMEOUT_S` (per-chunk dub transcription,
-default 120). **Raise** them for very long single files/generations, **lower**
-them to fail faster on a small machine.
+the bounds with `OMNIVOICE_ASR_TRANSCRIBE_TIMEOUT_S` (whole-file transcription
+floor, default 300 seconds), `OMNIVOICE_GENERATE_TIMEOUT_S` (generation, default
+300 seconds), and `OMNIVOICE_TRANSCRIBE_CHUNK_TIMEOUT_S` (per-chunk dubbing,
+default 120 seconds).
+
+Whole-file ASR allows the larger of its floor and twice the audio duration: a
+25-minute recording gets 50 minutes. This covers file uploads, OpenAI-compatible
+transcription, batch dubbing, legacy dubbing and streams whose speaker engine
+requires the whole recording. Set `OMNIVOICE_ASR_TIMEOUT_REALTIME_FACTOR` to
+change the multiplier, or `0` to keep only the fixed floor. Invalid, negative
+or non-finite settings fall back to defaults. Duration comes from a local-only
+ffprobe check bounded to 10 seconds; unavailable duration uses the floor.
+
+Queueing, model loading and child inference share one deadline. Sidecars,
+including the Windows ROCm proxy, and whisper.cpp use its remaining time rather
+than a separate five- or ten-minute ceiling. Calls directly to an isolated
+engine without a route guard retain `OMNIVOICE_ASR_RECV_TIMEOUT_S` as their
+floor (default 600 seconds). Progress does not extend the deadline; timed-out
+in-process inference remains accounted for until its native worker exits.
 
 Saving a cloned voice without a transcript transcribes the reference with an
 installed speech-to-text model for at most 60 seconds
@@ -1299,13 +1331,16 @@ Full guide: [dubbing/translation-engines.md](../dubbing/translation-engines.md#i
 
 ## First-run setup fails on a restricted network (GitHub/PyPI blocked)
 
-On networks that block or can't resolve **GitHub**, the first-run bootstrap may
-fail to download the managed Python (`uv venv ... failed`, often a DNS error).
-VoiceStudio now tries, in order: the default GitHub host → a gh-proxy mirror → your
-**system Python** (if 3.11+ is installed). If all three fail:
+On networks that block, throttle or can't resolve **GitHub**, first-run setup may
+stall or fail while downloading the managed Python (the setup screen shows
+`cpython-3.11.… (download)`). With the download region on **Auto-detect**,
+setup retries a failed or stalled Python download once from the other source
+(GitHub ↔ the `gh-proxy.com` mirror) and notes the switch in the setup log; a
+region you picked, or your own `UV_PYTHON_INSTALL_MIRROR`, is kept as is. If
+both fail:
 
-1. **Install Python 3.11+** from <https://www.python.org/downloads/> (on Windows,
-   tick *"Add Python to PATH"*), then relaunch — VoiceStudio will use it.
+1. **Choose the Russia or Restricted download region** under **Options** on the
+   setup screen and press Retry: both start from the mirror.
 2. **Point at a reachable mirror** for the Python download:
    - `UV_PYTHON_INSTALL_MIRROR=https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download`
 3. **In China, keep Auto-detect or pick the China download region** under
@@ -1403,7 +1438,14 @@ uses the mirror only when it answers and is clearly faster. Any doubt keeps
 `files.pythonhosted.org`; the setup log line `PyPI speed check: ...` shows the
 result. **Global** never runs the check; **China** always uses the mirror. If the
 mirror fails, setup retries once from `files.pythonhosted.org` and keeps every
-file that finished. The PyTorch wheels on `download-r2.pytorch.org` have no
+file that finished. In **Auto-detect**, a later DNS, connection or temporary server
+failure for a pinned PyPI file also tries the Aliyun mirror once. This covers
+small source archives as well as wheels; their locked hashes are unchanged.
+The fallback only applies when the failed URL identifies PyPI, and does not
+change an explicit **Global** choice or retry authentication/integrity errors
+through another host. If both hosts fail, fix the network/DNS problem and press
+**Retry**. Failure reports name the URL's failed host instead of a previously
+active large download. The PyTorch wheels on `download-r2.pytorch.org` have no
 mirror and download from there in every region. PyPI mirror variables
 (`UV_DEFAULT_INDEX`, `UV_INDEX_URL`) do not redirect the locked wheels
 ([#3444](https://github.com/debpalash/VoiceStudio/issues/3444)).
@@ -1632,10 +1674,36 @@ not download or load model weights.
 Crash details and bug reports keep the raw exit code and name recognized Windows
 faults (for example, `3221225477 (0xC0000005 STATUS_ACCESS_VIOLATION)`). The signed
 Windows representation `-1073741819` identifies the same fault. SIGSEGV and SIGILL
-are also identified as native faults. These failures happen below Python, so a
+are also identified as native faults, as are `0xC0000006 STATUS_IN_PAGE_ERROR`,
+`0xC0000374 STATUS_HEAP_CORRUPTION` and the other fault statuses Windows uses for
+an unhandled native exception. These failures happen below Python, so a
 Python traceback may not exist; include the captured crash details and system/GPU
 information when reporting them. The name identifies the failure category, not
 its cause: it does not by itself prove a driver, model, or memory problem.
+
+Python's fault dump names the Python line that was running, not the library that
+crashed. On Windows, VoiceStudio therefore reads the Windows Error Reporting
+event for the crashed backend (Event Viewer → Windows Logs → Application,
+"Application Error", event 1000) and adds the faulting module, its version and
+the offset to the report's install-failure facts. This happens only after a
+crash, reads only the local event log, and leaves the machine only if you submit
+the report. When the module is a graphics driver or GPU library (for example
+`nvcuda64.dll`, `cublasLt64_12.dll`, `igc64.dll`, `amdhip64_6.dll`), the failure
+screen says so and offers **Restart on CPU**. Settings → Performance & Device needs
+a running engine, so this button stores the same CPU choice (`compute_device` in
+the data folder's `prefs.json`) and starts the engine again. Switch back to Auto in
+Settings → Performance & Device after updating the driver. An explicit CPU choice
+also keeps a DirectML-capable PC on the CPU, and the engine then does not probe any
+GPU runtime (CUDA, DirectML, XPU, MPS) at startup, so the faulting driver is not
+loaded again; Settings offers Auto and CPU until you choose Auto. A device override
+saved in Settings' environment variables (`env.OMNIVOICE_DEVICE` in `prefs.json`)
+is removed by this button, because it would win over the CPU choice. The button is not shown when
+`OMNIVOICE_DEVICE` is set, because that variable overrides the setting, or when
+`OMNIVOICE_BACKEND_CMD` starts a custom backend that may not read it. If the
+setting cannot be saved (an unwritable data folder or a full disk), the screen
+says so and Retry stays available.
+CPU libraries such as Intel MKL (`mkl_*.dll`) or OpenMP (`libiomp5md.dll`) do not
+count as driver faults.
 
 On macOS, stopping a timed-out engine or installer operation can race with its
 supervisor exiting. VoiceStudio briefly rechecks that exact owned supervisor before
@@ -1674,6 +1742,10 @@ reconnecting automatically; the workspace stays usable.
   blocked executable. Add VoiceStudio's runtime folder to your antivirus
   exclusions (Windows Security → Virus & threat protection → Manage settings →
   Exclusions) and make sure it is not inside OneDrive, then retry.
+- **`Could not start <program>: spawn ETIMEDOUT`** — the operating system gave
+  up starting the program; on macOS this happens when its security check of the
+  executable stalls. VoiceStudio retries twice on its own (after 2 s and 5 s).
+  If it still fails, restart the computer and open VoiceStudio again.
 - **`… spawn UNKNOWN. Windows Smart App Control blocked it.`** — Smart App
   Control (Windows 11) blocks programs without a known reputation, including the
   runtime's `python.exe`; Event Viewer → Applications and Services Logs →
@@ -1807,3 +1879,9 @@ Self-update needs the `app-update.yml` file that release installers ship in the 
 ## Backend exits with an illegal instruction on an older CPU
 
 The effects library `pedalboard` can crash on CPUs without AVX2. VoiceStudio now loads it once in a separate process first; if that fails, effects stages that depend on it (filters, compressor, reverb, gate, EQ) are skipped and the audio is left unmodified, while the leveler and limiter keep working.
+
+## Browser crashes with "Cannot read properties of undefined (reading 'filter')"
+
+If the stack names `useModelInstallCompletionRefresh`, the model-install status response is incomplete. VoiceStudio now rejects malformed status responses while keeping the last valid download state, so the listener and other model-install screens remain mounted. A failed response does not mark a download complete.
+
+For a custom browser deployment, check that its API points to the VoiceStudio Python backend from the same release. `/models/install/status` returns an object with a `jobs` array; a placeholder API or mismatched backend can return a different body. Include the endpoint's response shape (without private data) when reporting a persistent mismatch.

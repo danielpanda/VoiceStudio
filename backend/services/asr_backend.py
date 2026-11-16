@@ -27,6 +27,7 @@ import asyncio
 import inspect
 import ipaddress
 import logging
+import math
 import os
 import re
 import contextlib
@@ -37,6 +38,7 @@ import weakref
 from urllib.parse import urlsplit
 from core import import_probe
 from utils.containment import contain_system_exit
+from core.asr_budget import transcribe_budget_s
 
 from abc import ABC, abstractmethod
 from collections import OrderedDict
@@ -51,13 +53,13 @@ logger = logging.getLogger("omnivoice.asr")
 # where the resident TTS model contends for memory — hung the request *and* tied
 # up a GPU-pool worker, surfacing in the UI as the misleading "can't reach the
 # local backend" (TamKieu / Vietnam report). Bound them so a hang becomes a fast,
-# actionable error instead. Generous default (whole-file large-v3 on CPU is slow
-# but valid); override with the env var for very long single files.
-ASR_TRANSCRIBE_TIMEOUT_S = float(os.environ.get("OMNIVOICE_ASR_TRANSCRIBE_TIMEOUT_S", "300.0"))
+# actionable error instead. Whole-file callers supply local duration or a path;
+# the shared budget grows with recording length while this remains its floor.
+ASR_TRANSCRIBE_TIMEOUT_S = transcribe_budget_s()
 
 
 class ASRTimeoutError(TimeoutError):
-    """Raised when a whole-file transcribe exceeds ASR_TRANSCRIBE_TIMEOUT_S.
+    """Raised when a transcription exhausts its finite execution deadline.
 
     Carries a user-actionable message: the backend is alive (this is not a
     connection failure) — the ASR model is too heavy for the available compute.
@@ -67,12 +69,9 @@ class ASRTimeoutError(TimeoutError):
 def reset_pool_after_wedge(executor, *, what: str = "ASR") -> bool:
     """Abandon a GPU pool whose worker is wedged on a timed-out transcribe (#730).
 
-    Python can't kill the stuck thread, but dropping the poisoned pool means the
-    next submit (a retry, the next chunk, or a concurrent TTS generate) gets a
-    fresh worker instead of queueing behind the wedged one. This is the ONE
-    recovery mechanism shared by every transcribe path — the whole-file guards
-    (via :func:`run_transcribe_guarded`) and the chunked dub stream both route
-    through it, so the semantics can't drift between them again.
+    This is opt-in recovery for a caller whose backing process can be safely
+    terminated. In-process inference keeps its worker accounted for until the
+    native call exits; whole-file and chunk guards retain that default (#1669).
 
     Best-effort: an executor without ``reset()`` (a plain ThreadPoolExecutor in
     tests) is a no-op, and a failing reset never raises — this runs on the very
@@ -149,14 +148,74 @@ def _isolated_engine_hint(streak: int) -> str:
     )
 
 
+def file_transcribe_deadline(path: str, *, floor_s: float | None = None,
+                             started_at: float | None = None) -> float:
+    from services.asr_timing import transcribe_deadline
+    from services.ffmpeg_utils import probe_audio_duration
+
+    return transcribe_deadline(
+        lambda: transcribe_budget_s(probe_audio_duration(path), floor_s=floor_s),
+        started_at=started_at,
+    )
+
+
+async def probe_transcribe_deadline(path: str, *, on_abandon=None) -> float:
+    """Keep the input owned until the physical metadata reader has stopped."""
+    from services.model_manager import _cpu_pool
+
+    concurrent_probe = _cpu_pool.submit(file_transcribe_deadline, path, started_at=time.monotonic())
+    probe = asyncio.wrap_future(concurrent_probe)
+    probe_budget = transcribe_budget_s()
+    try:
+        return await asyncio.wait_for(asyncio.shield(probe), timeout=probe_budget)
+    except (asyncio.CancelledError, asyncio.TimeoutError) as exc:
+        # cancel() succeeds only before the reader starts. A running reader's
+        # concurrent Future completes only after it has closed the input.
+        cancelled_before_start = concurrent_probe.cancel()
+
+        def consume_result(done):
+            if not done.cancelled():
+                done.exception()
+
+        probe.add_done_callback(consume_result)
+        if on_abandon is not None:
+            def release_input(_done):
+                try:
+                    on_abandon()
+                except Exception:
+                    logger.exception("ASR probe abandon cleanup failed")
+
+            concurrent_probe.add_done_callback(release_input)
+        elif not cancelled_before_start:
+            # A caller retaining cleanup needs us to drain before it deletes
+            # the file. Repeated cancellation must not cut that drain short.
+            while not concurrent_probe.done():
+                try:
+                    await asyncio.shield(probe)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        raise ASRTimeoutError(f"ASR duration probe exceeded {probe_budget:g}s") from None
+
+
 async def run_transcribe_guarded(executor, fn, *, what: str = "ASR",
-                                 timeout: float = ASR_TRANSCRIBE_TIMEOUT_S,
+                                 timeout: float | None = None,
+                                 audio_path: str | None = None,
+                                 duration_s: float | None = None,
+                                 deadline: float | None = None,
                                  timeout_env: str = "OMNIVOICE_ASR_TRANSCRIBE_TIMEOUT_S",
                                  reset_on_timeout: bool = False,
                                  on_abandon=None):
     """Run a blocking transcribe ``fn`` in ``executor`` with a hard wall-clock
     bound. On timeout, raise :class:`ASRTimeoutError` with guidance instead of
     letting the request hang forever.
+
+    Whole-file paths/durations scale the default floor with recording length.
+    Explicit chunk timeouts stay fixed. The deadline starts before submission,
+    so queueing and the engine's own child-process wait cannot renew it.
 
     A future cannot cancel the underlying thread, so a timed-out
     in-process CTranslate2/whisperx call still owns its model and device. The
@@ -170,12 +229,11 @@ async def run_transcribe_guarded(executor, fn, *, what: str = "ASR",
     immediately; running work calls it from the worker finalizer. Normal
     completion leaves cleanup with the caller.
     """
+    from core import diagnostic_reports
+    diagnostic_epoch = diagnostic_reports.inherited_grant()
     from services.inference_cancellation import InferenceCancellation
-    cancellation = InferenceCancellation()
-    loop = asyncio.get_running_loop()
-    # Same SystemExit containment as the TTS pool (#1133 class): an ASR
-    # dependency written as a CLI must not be able to shut the backend down.
-    inner = contain_system_exit(fn, what)
+    from services.asr_timing import remaining_s
+
     abandon_lock = threading.Lock()
     abandon_state = {
         "requested": False,
@@ -195,9 +253,29 @@ async def run_transcribe_guarded(executor, fn, *, what: str = "ASR",
         except Exception:  # noqa: BLE001 — cleanup cannot hide the ASR result
             logger.exception("%s abandon cleanup failed", what)
 
+    if deadline is not None and timeout is not None:
+        deadline = min(deadline, time.monotonic() + timeout)
+    if deadline is None:
+        if timeout is None and audio_path:
+            deadline = await probe_transcribe_deadline(
+                audio_path, on_abandon=_fire_abandon_callback if on_abandon is not None else None,
+            )
+        else:
+            if timeout is None:
+                timeout = transcribe_budget_s(duration_s)
+            deadline = time.monotonic() + timeout
+    timeout = remaining_s(deadline)
+    cancellation = InferenceCancellation(deadline=deadline)
+    loop = asyncio.get_running_loop()
+    # Same SystemExit containment as the TTS pool (#1133 class): an ASR
+    # dependency written as a CLI must not be able to shut the backend down.
+    inner = contain_system_exit(fn, what)
+
     def _job():
         try:
             with cancellation.activate():
+                if remaining_s(deadline) <= 0:
+                    raise ASRTimeoutError("ASR deadline expired before execution")
                 return inner()
         finally:
             with abandon_lock:
@@ -206,7 +284,7 @@ async def run_transcribe_guarded(executor, fn, *, what: str = "ASR",
             if abandoned:
                 _fire_abandon_callback()
 
-    concurrent_fut = executor.submit(_job)
+    concurrent_fut = executor.submit(diagnostic_reports.bind_callable(_job, diagnostic_epoch))
     fut = asyncio.wrap_future(concurrent_fut, loop=loop)
 
     def _abandon() -> None:
@@ -222,7 +300,7 @@ async def run_transcribe_guarded(executor, fn, *, what: str = "ASR",
     try:
         # Shield the wrapper so timeout does not discard our ability to tell a
         # queued cancellation from a native thread that is still running.
-        result = await asyncio.wait_for(asyncio.shield(fut), timeout=timeout)
+        result = await asyncio.wait_for(asyncio.shield(fut), timeout=remaining_s(deadline))
     except asyncio.CancelledError:
         _abandon()
         raise
@@ -245,7 +323,15 @@ async def run_transcribe_guarded(executor, fn, *, what: str = "ASR",
         hint = _isolated_engine_hint(streak)
         if hint:
             msg += " " + hint
-        raise ASRTimeoutError(msg)
+        failure = ASRTimeoutError(msg)
+        # This is a local compute deadline, not a transport timeout.
+        if diagnostic_epoch is not None:
+            diagnostic_reports.capture_failure("transcription", error=failure, error_code="UNKNOWN", expected_epoch=diagnostic_epoch)
+        raise failure
+    except Exception as exc:
+        if diagnostic_epoch is not None:
+            diagnostic_reports.capture_failure("transcription", error=exc, expected_epoch=diagnostic_epoch)
+        raise
     # A completed transcribe (even a failed-but-returned one) proves the pool
     # isn't hung — only genuine timeouts count toward the consecutive streak.
     _note_transcribe_success()
@@ -433,6 +519,36 @@ def whisper_checkpoint_translates(model_name: str | None) -> bool:
     return not ("turbo" in name or name.endswith(".en") or "distil" in name)
 
 
+def has_recognition_timestamps(result: dict, *, segments=None) -> bool:
+    """Whether every spoken cue has ASR timing, rather than a guessed clip span.
+
+    Text-only adapters must opt out even when they retain rough numeric bounds
+    for dubbing compatibility. Validate both raw and rendered segments so a
+    missing bound or rounding cannot manufacture a usable subtitle interval.
+    """
+    if "timestamps_available" in result and result["timestamps_available"] is not True:
+        return False
+
+    def valid(items):
+        if not isinstance(items, (list, tuple)):
+            return False
+        spoken = False
+        for segment in items:
+            if not isinstance(segment, dict) or not isinstance(segment.get("text"), str):
+                return False
+            if not segment["text"].strip():
+                continue
+            start, end = segment.get("start"), segment.get("end")
+            if not all(type(value) in (int, float) and math.isfinite(value) for value in (start, end)):
+                return False
+            if start < 0 or end <= start:
+                return False
+            spoken = True
+        return spoken
+
+    return valid(result.get("segments")) and (segments is None or valid(segments))
+
+
 class ASRBackend(ABC):
     id: str = "base"
     display_name: str = "Base ASR"
@@ -446,6 +562,8 @@ class ASRBackend(ABC):
     # conservative default is CPU-only; installed native runtimes may narrow
     # or extend their metadata through runtime_gpu_compat().
     gpu_compat: tuple[str, ...] = ("cpu",)
+    # Explicit loader policy, not inferred from imports or accelerator support.
+    gpu_self_test_policy = "independent"
 
     @classmethod
     def runtime_gpu_compat(cls):
@@ -684,6 +802,7 @@ class WhisperXBackend(ASRBackend):
     # Windows HIP heavy pipelines remain gated pending MIOpen validation.
     # CPU execution remains available independently of basic HIP CT2 support.
     gpu_compat = ("cuda", "cpu")
+    gpu_self_test_policy = "fallback"  # _pick_device always honors failure_warning()
 
     def __init__(self):
         self._model_name = os.environ.get("ASR_MODEL_WHISPERX", "large-v3")
@@ -813,6 +932,12 @@ class WhisperXBackend(ASRBackend):
             raise PipelineCompatibilityError(reason)
         if self._asr is not None:
             return
+        # Construction can precede completion of the background GPU test.
+        # Recheck at the actual load boundary; alignment uses this same device.
+        from core.gpu_self_test import failure_warning
+
+        if self._device == "cuda" and failure_warning():
+            self._device, self._compute_type = "cpu", "int8"
         # Patch speechbrain's lazy-import guard BEFORE whisperx pulls in pyannote
         # → speechbrain, or a stray k2_fsa redirect import aborts ASR on Windows
         # (#630/#611/#647). No-op on macOS/Linux and when speechbrain is absent.
@@ -1513,6 +1638,7 @@ class MLXWhisperBackend(ASRBackend):
 
 
 class PyTorchWhisperBackend(ASRBackend):
+    gpu_self_test_policy = "forceable"  # _pick_device uses get_best_device()
     id = "pytorch-whisper"
     display_name = "PyTorch Whisper (CUDA / CPU via transformers pipeline)"
     # Pure transformers pipeline → runs wherever torch does. A ROCm (HIP)
@@ -2153,6 +2279,7 @@ class MoonshineASRBackend(ASRBackend):
             "chunks": chunks,
             "segments": segments_out,
             "language": "en",
+            "timestamps_available": False,
         }
 
     def unload(self) -> None:
@@ -2314,7 +2441,8 @@ def _sherpa_result(text: str, samples, sr) -> dict:
     if text:
         segments.append({"text": text, "start": 0.0, "end": duration, "words": []})
     chunks = [{"text": s["text"], "timestamp": (s["start"], s["end"])} for s in segments]
-    return {"chunks": chunks, "segments": segments, "language": "auto", "text": text}
+    return {"chunks": chunks, "segments": segments, "language": "auto", "text": text,
+            "timestamps_available": False}
 
 
 # ── Registry ────────────────────────────────────────────────────────────────
@@ -2718,6 +2846,8 @@ class OpenAICompatASRBackend(ASRBackend):
                    language: str | None = None, initial_prompt: str | None = None,
                    temperature: float | None = None,
                    task: str = "transcribe") -> dict:
+        from services.asr_timing import remaining_s
+        deadline = file_transcribe_deadline(audio_path)
         logger.info(
             "OpenAI-compat ASR transcribing %s (base_url=%s, model=%s)",
             audio_path, self._base_url, self._model,
@@ -2739,6 +2869,7 @@ class OpenAICompatASRBackend(ASRBackend):
                 try:
                     resp = endpoint.create(
                         file=f, model=self._model, response_format="verbose_json",
+                        timeout=remaining_s(deadline),
                         **extra,
                     )
                 except Exception:
@@ -2747,9 +2878,14 @@ class OpenAICompatASRBackend(ASRBackend):
                     # failure. Re-open: the SDK may have partially consumed
                     # the file handle on the first attempt.
                     f.seek(0)
+                    if remaining_s(deadline) <= 0:
+                        raise ASRTimeoutError("Remote ASR transcription deadline expired") from None
                     resp = endpoint.create(
-                        file=f, model=self._model, response_format="json", **extra,
+                        file=f, model=self._model, response_format="json",
+                        timeout=remaining_s(deadline), **extra,
                     )
+        except ASRTimeoutError:
+            raise
         except Exception as exc:
             # Never leak a raw SDK/httpx exception object (auth headers,
             # connection internals) straight into a user-facing message —

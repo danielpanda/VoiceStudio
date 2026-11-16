@@ -1,6 +1,13 @@
 import type { CrashContext } from '../shared/utils/crashContext';
 import type { HostSnapshotLike } from '../shared/utils/hostSnapshot';
 import type { InstallFailure } from '../shared/utils/installFailure';
+import type { DiagnosticInput, DiagnosticState } from './diagnostics';
+export type {
+  DiagnosticInput,
+  DiagnosticState,
+  DiagnosticCategory,
+  DiagnosticStage,
+} from './diagnostics';
 /**
  * The contextBridge surface exposed to the renderer as `window.voicestudio`.
  *
@@ -49,6 +56,8 @@ export interface BackendStatus {
   analyticsDisabled?: boolean;
   /** Code and facts for the current install or startup failure. */
   failure?: InstallFailure;
+  /** The local engine crashed and can be started again on CPU (`backend.restartOnCpu`). */
+  cpuRestartAvailable?: boolean;
   stage: BackendStage;
   setupIssue?:
     | 'space'
@@ -422,6 +431,11 @@ export interface SetupConnectionCheck {
 }
 
 export interface VoiceStudioBridge {
+  diagnostics: {
+    getStatus(): Promise<DiagnosticState>;
+    setConsent(enabled: boolean): Promise<DiagnosticState>;
+    capture(event: DiagnosticInput, expectedEpoch: string): Promise<void>;
+  };
   /** VoiceStudio Cloud account; never carries a token. */
   account: {
     get(): Promise<AccountPublicState>;
@@ -505,6 +519,8 @@ export interface VoiceStudioBridge {
     onStatus(cb: (status: BackendStatus) => void): () => void;
     /** Kill (if managed) and relaunch the backend. */
     restart(): Promise<void>;
+    /** Store CPU as the compute device and restart a crashed local engine. */
+    restartOnCpu?(): Promise<void>;
     setupRuntime(): Promise<void>;
     cleanSetupRuntime(): Promise<void>;
     setupRuntimeOnCpu(): Promise<void>;

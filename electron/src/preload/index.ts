@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
+import { DIAGNOSTIC_CHANNELS } from './diagnostics';
 import type {
   BackendStatus,
   DataRelocationStage,
@@ -21,6 +22,12 @@ function subscribe<T>(channel: string, cb: (payload: T) => void): () => void {
 }
 
 const bridge: VoiceStudioBridge = {
+  diagnostics: {
+    getStatus: () => ipcRenderer.invoke(DIAGNOSTIC_CHANNELS.getStatus),
+    setConsent: (enabled) => ipcRenderer.invoke(DIAGNOSTIC_CHANNELS.setConsent, enabled),
+    capture: (event, expectedEpoch) =>
+      ipcRenderer.invoke(DIAGNOSTIC_CHANNELS.capture, event, expectedEpoch),
+  },
   browser: {
     open: (url) => ipcRenderer.invoke('site-browser:open', url),
     close: () => ipcRenderer.invoke('site-browser:close'),
@@ -128,6 +135,7 @@ const bridge: VoiceStudioBridge = {
     useDiscoveredPythonRuntime: (pythonPath) =>
       ipcRenderer.invoke('backend:useDiscoveredPythonRuntime', pythonPath),
     restart: () => ipcRenderer.invoke('backend:restart') as Promise<void>,
+    restartOnCpu: () => ipcRenderer.invoke('backend:restartOnCpu') as Promise<void>,
     getConnection: () => ipcRenderer.invoke('backend:getConnection'),
     getHostSnapshot: () => ipcRenderer.invoke('backend:hostSnapshot'),
     getSetupDiagnostics: () => ipcRenderer.invoke('backend:setupDiagnostics'),

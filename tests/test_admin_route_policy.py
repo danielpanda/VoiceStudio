@@ -292,3 +292,75 @@ def test_calls_pairing_exception_does_not_expose_settings():
     assert "require_call_control" in _dependency_names(_router_assignment(tree))
     for function in ("get_settings", "put_settings"):
         assert "require_admin" in _dependency_names(_route_decorators(tree, function))
+
+
+# Destructive/privileged routes a route census found still at tier T-NONE.
+# Editing/deleting stored content and starting host-side work is admin-only;
+# POST /generate stays on the documented consumer surface so a PIN-paired
+# phone keeps synthesizing.
+_REMAINING_MUTATING_ROUTE_TIERS = [
+    ("generation.py", "clear_history", "require_admin"),
+    ("generation.py", "delete_single_history", "require_admin"),
+    ("generation.py", "set_history_starred", "require_admin"),
+    ("generation.py", "generate_speech", "require_consumer"),
+    ("dub_core.py", "clear_dub_history", "require_admin"),
+    ("dub_core.py", "delete_single_dub_history", "require_admin"),
+    ("dub_core.py", "dub_import_srt", "require_admin"),
+    ("dub_core.py", "dub_sync_transcript", "require_admin"),
+    ("dub_core.py", "dub_cleanup_segments", "require_admin"),
+    ("dub_core.py", "dub_use_downloaded_captions", "require_admin"),
+    ("model_licenses.py", "prepare_model_install", "require_consumer"),
+    ("model_licenses.py", "commit_model_install", "require_consumer"),
+    ("model_licenses.py", "verify_model_install", "require_admin"),
+    ("model_licenses.py", "remove_model_receipt", "require_admin"),
+    ("archetypes.py", "set_preview_gallery", "require_admin"),
+    ("archetypes.py", "check_preview_gallery", "require_admin"),
+    ("archetypes.py", "use_archetype", "require_admin"),
+    ("community.py", "community_use", "require_admin"),
+    ("setup/wizard.py", "setup_warmup", "require_consumer"),
+    ("tools.py", "parse_direction", "require_admin"),
+    ("tools.py", "rate_fit", "require_admin"),
+    ("tools.py", "normalize_workflow_speech", "require_admin"),
+    ("tools.py", "analyse_video_context", "require_admin"),
+]
+
+
+@pytest.mark.parametrize("filename,function_name,dependency", _REMAINING_MUTATING_ROUTE_TIERS)
+def test_remaining_mutating_routes_are_tiered(filename, function_name, dependency):
+    dependencies = _dependency_names(_route_decorators(_tree(filename), function_name))
+    assert dependency in dependencies, f"{filename}:{function_name}"
+    assert "require_loopback" not in dependencies, f"{filename}:{function_name}"
+
+
+def test_sonitranslate_install_routes_stay_desktop_only():
+    """SoniTranslate's install/start/stop are managed-sidecar operations: the
+    installer clones mutable upstream source and pip-installs it, and start()
+    spawns that checkout with HF_TOKEN in the child env.  They carry the same
+    admin + desktop gate as /engines/sidecar/{engine_id}/install; the dub route
+    stays a plain native-access consumer route."""
+    tree = _tree("sonitranslate.py")
+    for function_name in (
+        "sonitranslate_install",
+        "sonitranslate_start",
+        "sonitranslate_stop",
+    ):
+        dependencies = _dependency_names(_route_decorators(tree, function_name))
+        assert {"require_admin", "require_desktop"} <= dependencies, function_name
+        assert "require_loopback" not in dependencies, function_name
+    assert "require_native_access" in _dependency_names(
+        _route_decorators(tree, "sonitranslate_dub")
+    )
+
+
+def test_model_lifecycle_routes_are_gated():
+    """Model deletion irreversibly drops cached revisions, so it needs the admin
+    gate; installing and cancelling an install stay consumption so a bare Docker
+    first-run and PIN-paired clients keep working."""
+    tree = _tree(Path("setup") / "download.py")
+    delete = _dependency_names(_route_decorators(tree, "delete_model"))
+    assert "require_admin" in delete, delete
+    assert "require_loopback" not in delete, delete
+    for function in ("install_model", "cancel_install"):
+        dependencies = _dependency_names(_route_decorators(tree, function))
+        assert "require_consumer" in dependencies, (function, dependencies)
+        assert "require_admin" not in dependencies, (function, dependencies)

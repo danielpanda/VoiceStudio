@@ -364,7 +364,13 @@ launches and app updates keep ROCm without the variable. To leave ROCm, launch
 once with `OMNIVOICE_TORCH_VARIANT=cpu`.
 Runtime setup then reinstalls `torch`/`torchaudio`/`torchvision` from the ROCm
 wheel index (`https://download.pytorch.org/whl/rocm7.1` by default) right after
-the dependency sync, leaving every other package on the regular index, matched to the app's pinned `torch==2.10.0` (the rocm6.2 index
+the frozen dependency sync. That sync skips the locked CUDA Torch wheels and
+their NVIDIA runtime packages instead of downloading them before replacing
+Torch. Shared dependencies, including `nvidia-ml-py` for hardware metadata,
+stay on the locked regular index. The sync preserves a matching ROCm overlay
+on resume or repair; switching from CUDA removes its old runtime packages,
+including after an earlier switch stopped before verification.
+The ROCm wheels are matched to the app's pinned `torch==2.10.0` (the rocm6.2 index
 only ever published up to torch 2.5.1). **Settings → Performance → GPU
 acceleration** reports which PyTorch build is installed. The option is ignored
 on macOS; on Windows it selects the opt-in stack in
@@ -422,6 +428,18 @@ report the GPU device instead of `cpu`. Verify the wheel sees your card:
 ```bash
 uv run python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 ```
+
+Device enumeration does not prove that GPU work succeeds. VoiceStudio also
+runs a bounded GPU self-test in a child process. If that test fails, System
+check warns. The VoiceStudio (OmniVoice), PyTorch Whisper and WhisperX loaders
+follow this test's CPU fallback, so their routing reports the failure.
+Independent loaders, including CTranslate2/faster-whisper, ONNX, external
+servers and child processes, retain their own routing; the parent test does
+not verify them. A pending or inconclusive test does not disable acceleration.
+Explicitly forcing the GPU retains the choice with a warning only for loaders
+that honor that override; WhisperX still follows its existing CPU fallback.
+Missing-kernel warnings retain their architecture-specific recovery advice.
+These checks identify a failed test, not its hardware or driver cause.
 
 Notes:
 - ROCm is exercised far less than the default CUDA/MPS/CPU paths — it works,

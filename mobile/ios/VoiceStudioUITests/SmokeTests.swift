@@ -6,18 +6,33 @@ import XCTest
 let uiReadyTimeout: TimeInterval = 45
 
 extension XCUIElement {
-    /// Waits for the element to exist, then taps it (XCTest scrolls it into view itself).
+    /// Waits for the element to exist, then taps it. XCTest scrolls an element into view
+    /// only once it is in the accessibility hierarchy; a row of a lazy stack, grid or list
+    /// that has not been scrolled to is not, so reach those with `reveal` instead.
     @MainActor func tapReady(timeout: TimeInterval = uiReadyTimeout, file: StaticString = #filePath, line: UInt = #line) {
         guard waitReady(timeout: timeout, file: file, line: line) else { return }
         tap()
     }
+    /// Typing lands asynchronously: the last keystroke can reach the accessibility value a
+    /// moment after `typeText` returns (CI saw "…smoke tes" for "…smoke test"). Wait for the
+    /// value instead of reading it once; a keystroke that is really lost still fails.
+    @MainActor func waitForValue(_ expected: String, timeout: TimeInterval = 10, file: StaticString = #filePath, line: UInt = #line) {
+        let typed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", expected), object: self)
+        if XCTWaiter().wait(for: [typed], timeout: timeout) != .completed {
+            XCTAssertEqual(value as? String, expected, file: file, line: line)
+        }
+    }
     /// Waits for the element to exist; reports which element and which screen when it never does.
+    /// Lazy content that is not on screen never appears here: use `reveal` for it.
     @MainActor @discardableResult func waitReady(timeout: TimeInterval = uiReadyTimeout, file: StaticString = #filePath, line: UInt = #line) -> Bool {
         if waitForExistence(timeout: timeout) { return true }
         let app = XCUIApplication()
-        let screen = app.navigationBars.firstMatch.exists ? app.navigationBars.firstMatch.identifier : "(no navigation bar)"
-        let what = identifier.isEmpty ? label : identifier
-        XCTFail("Element '\(what)' did not appear within \(Int(timeout))s on screen '\(screen)'", file: file, line: line)
+        let bar = app.navigationBars.firstMatch
+        let screen = bar.exists ? bar.description : "(no navigation bar)"
+        // `description` names the query (e.g. `"home.gallery" Button`) without resolving it.
+        // `identifier` or `label` would resolve the missing element, and that failure
+        // ("Failed to get matching snapshot") would replace this message.
+        XCTFail("Element \(description) did not appear within \(Int(timeout))s on screen \(screen)", file: file, line: line)
         return false
     }
 }
@@ -157,7 +172,7 @@ final class SmokeTests: XCTestCase {
         XCTAssertEqual(no.label, "No thanks")
         XCTAssertEqual(yes.frame.width, no.frame.width, accuracy: 1)
         XCTAssertFalse(app.buttons["consent.dismiss"].exists)
-        XCTAssertTrue(app.staticTexts["This companion app records your choice on this phone. It sends no analytics."].exists)
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label == %@", "Usage analytics are not sent from this phone; your choice is stored locally. Automatic diagnostic reports have a separate opt-in.")).firstMatch.exists)
         // First opt in, then prove passive dismissal replaces a prior Yes with No.
         yes.tap()
         XCTAssertTrue(app.tabBars.buttons["Settings"].waitForExistence(timeout: uiReadyTimeout))
@@ -212,7 +227,7 @@ final class SmokeTests: XCTestCase {
         app.launch()
         connect(app)
         XCTAssertTrue(app.textViews["speak.text"].waitForExistence(timeout: uiReadyTimeout))
-        XCTAssertTrue(app.descendants(matching: .any)["page.loading"].firstMatch.exists)
+        XCTAssertTrue(app.descendants(matching: .any)["page.loading"].firstMatch.waitForExistence(timeout: uiReadyTimeout))
         app.tabButton("Dub").tapReady()
         XCTAssertTrue(app.textFields["dub.source_url"].waitForExistence(timeout: uiReadyTimeout))
         app.tabButton("Voices").tapReady()
@@ -320,7 +335,7 @@ final class SmokeTests: XCTestCase {
         XCTAssertTrue(app.buttons["choice.option.spanish"].exists)
         app.buttons["Close"].tapReady()
         editor.tapReady(); editor.typeText("VoiceStudio smoke test")
-        XCTAssertEqual(editor.value as? String, "VoiceStudio smoke test")
+        editor.waitForValue("VoiceStudio smoke test")
         dismissUsingDone(app)
         app.swipeUp()
         app.buttons["speak.generate"].tapReady()

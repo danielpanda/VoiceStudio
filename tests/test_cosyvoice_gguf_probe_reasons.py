@@ -2,12 +2,34 @@
 
 from __future__ import annotations
 
+import importlib
 import os
 import stat
 import sys
 
 import pytest
-from engines.cosyvoice_gguf import bootstrap
+
+
+class _LiveModule:
+    """Resolve the module at use time so sys.modules pollution cannot leave stale refs."""
+
+    def __init__(self, name):
+        object.__setattr__(self, "_name", name)
+
+    def _mod(self):
+        return importlib.import_module(object.__getattribute__(self, "_name"))
+
+    def __getattr__(self, attr):
+        return getattr(self._mod(), attr)
+
+    def __setattr__(self, attr, value):
+        setattr(self._mod(), attr, value)
+
+    def __delattr__(self, attr):
+        delattr(self._mod(), attr)
+
+
+bootstrap = _LiveModule("engines.cosyvoice_gguf.bootstrap")
 
 
 @pytest.fixture
@@ -35,6 +57,36 @@ def test_probe_success_path_unchanged(fake_cli, monkeypatch):
     monkeypatch.setenv("FAKE_OUT", "Vulkan0 - NVIDIA GeForce GTX 1080 Ti\nCPU - i5\n")
     selected, fallback = bootstrap.selected_backend()
     assert (selected.name, selected.target, fallback) == ("Vulkan0", "vulkan", None)
+
+
+def test_reported_split_output_selects_vulkan(fake_cli, monkeypatch):
+    """#3980: ggml logs on stderr, the table (bus ids, CRLF) on stdout."""
+    monkeypatch.setenv(
+        "FAKE_ERR",
+        "ggml_vulkan: Found 1 Vulkan devices:\r\nggml_vulkan: 0 = NVIDIA GeForce GTX 1080 Ti (NVIDIA)\r\n",
+    )
+    monkeypatch.setenv(
+        "FAKE_OUT",
+        "Available GGML backends:\r\n"
+        "  Vulkan0    0000:01:00.0         NVIDIA GeForce GTX 1080 Ti\r\n"
+        "  CPU        -                    Intel(R) Core(TM) i5-10400F CPU @ 2.90GHz\r\n",
+    )
+    selected, fallback = bootstrap.selected_backend()
+    assert (selected.name, selected.target, fallback) == ("Vulkan0", "vulkan", None)
+
+
+def test_cpu_only_listing_says_why_vulkan_is_missing(fake_cli, monkeypatch):
+    monkeypatch.setenv("FAKE_ERR", "ggml_vulkan: No devices found.\n")
+    monkeypatch.setenv("FAKE_OUT", "Available GGML backends:\n  CPU  -  i5\n")
+    monkeypatch.setenv("FAKE_EXIT", "0")
+    selected, fallback = bootstrap.selected_backend()
+    assert selected.name == "CPU"
+    assert "runtime said: ggml_vulkan: No devices found." in fallback
+    bootstrap._PROBE_CACHE.clear()
+    monkeypatch.setenv("FAKE_ERR", "")
+    monkeypatch.setenv("FAKE_EXIT", "5")
+    _, fallback = bootstrap.selected_backend()
+    assert "exit code 5" in fallback and "no Vulkan line" in fallback
 
 
 def test_nonzero_exit_with_a_device_list_is_still_usable(fake_cli, monkeypatch):

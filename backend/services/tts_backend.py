@@ -34,6 +34,7 @@ from typing import Literal, Optional
 
 import torch
 
+from services.instruct_safety import tag_safe_instruct
 from services.expression import COSYVOICE_INLINE_TAGS, OMNIVOICE_INLINE_TAGS, expression_caps
 
 logger = logging.getLogger("omnivoice.tts")
@@ -252,7 +253,11 @@ class TTSBackend(ABC):
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         # Enforce lifetime at the engine boundary so every caller is covered.
-        for name in ("generate", "generate_batch", "_ensure_loaded", "convert_voice"):
+        # ``selftest_generate`` (OmniVoice GGUF's bounded diagnostic) is a
+        # render too: an unload or idle sweep must not run under it.
+        for name in (
+            "generate", "generate_batch", "_ensure_loaded", "convert_voice", "selftest_generate",
+        ):
             method = cls.__dict__.get(name)
             if method is not None:
                 setattr(cls, name, _lease_render(method))
@@ -557,6 +562,9 @@ class TTSBackend(ABC):
     #: implementation supports (cuda / mps / rocm / cpu). This is metadata,
     #: not enforced — actual device selection lives in the engine's loader.
     gpu_compat: tuple[str, ...] = ("cpu",)
+    # Opt in only when the actual loader consumes the parent GPU self-test.
+    # Native libraries, upstream auto-device loaders and remote servers do not.
+    gpu_self_test_policy = "independent"
 
     #: Approximate VRAM (GB) the engine needs to render comfortably on a
     #: dedicated GPU. Metadata, like ``gpu_compat`` — never enforced, because a
@@ -583,7 +591,7 @@ class TTSBackend(ABC):
         installed executable determines both the available runtimes and the
         device actually selected.
         """
-        from services.engine_routing import resolve_routing, uses_parent_torch
+        from services.engine_routing import parent_self_test_policy, resolve_routing, uses_parent_torch
 
         gpu_compat = tuple(getattr(cls, "gpu_compat", ("cpu",)))
         min_vram_gb = float(getattr(cls, "min_vram_gb", 0.0) or 0.0)
@@ -593,6 +601,8 @@ class TTSBackend(ABC):
             **resolve_routing(
                 gpu_compat, caps, min_vram_gb,
                 parent_torch=uses_parent_torch(cls),
+                parent_process=not getattr(cls, "_is_subprocess_isolated", False),
+                self_test_policy=parent_self_test_policy(cls),
             ),
             "runtime_backend": None,
             "runtime_device_index": None,
@@ -1778,6 +1788,11 @@ def generate_with_cached_ref(model, *, ref_audio, ref_text, **gen_kw):
     # TypeError on an unknown kwarg.
     from services.model_manager import tts_inference
 
+    # Every native OmniVoice caller (audiobook, /generate, stream) converges
+    # here, so free-text directions degrade instead of raising (#4054).
+    if gen_kw.get("instruct"):
+        gen_kw["instruct"] = tag_safe_instruct(gen_kw["instruct"])
+
     # tts_inference: no device move of the shared model while this runs, and
     # it is restored first if an offload left it in RAM (#2618).
     with engine_in_use(OmniVoiceBackend(model=model)), tts_inference():
@@ -1824,12 +1839,23 @@ def generate_with_cached_ref(model, *, ref_audio, ref_text, **gen_kw):
                     logger.debug("failed to remove reference window")
 
 
-def clear_clone_prompt_cache() -> None:
+def clear_clone_prompt_cache(*, keep_passage_choices: bool = False) -> None:
     """Drop all cached voice-clone prompts (frees their tensors). Called on model
-    unload so a flush/engine-switch doesn't strand VRAM."""
+    unload so a flush/engine-switch doesn't strand VRAM.
+
+    ``keep_passage_choices`` keeps the remembered reference windows: they hold
+    only an index and transcript, no tensors, so a pre-generate cleanup keeps
+    them rather than rerunning reference ASR on the next request. Failed
+    rankings (``_NO_PASSAGE``) are still dropped, so a recognizer that has
+    recovered gets another try."""
     with _prompt_cache_lock:
         _prompt_cache.clear()
-        _passage_choices.clear()
+        if not keep_passage_choices:
+            _passage_choices.clear()
+        else:
+            for key, (index, _text) in list(_passage_choices.items()):
+                if index == _NO_PASSAGE:
+                    del _passage_choices[key]
         _unresolved_prompt_recognizers.clear()
 
 
@@ -1855,7 +1881,11 @@ class OmniVoiceBackend(TTSBackend):
     supports_voice_design = True
     # The model draws from a per-request generator, so a seed reproduces a take.
     supports_generation_seed = True
-    gpu_compat = ("cuda", "rocm", "mps", "cpu")
+    # "xpu": the in-process loader and the sidecar both run on Intel Arc via
+    # get_best_device(); without it routing reported a CPU fallback (and gave
+    # CPU budgets) for a model that was actually on the GPU.
+    gpu_compat = ("cuda", "rocm", "xpu", "mps", "cpu")
+    gpu_self_test_policy = "forceable"  # model_manager.get_best_device()
     # Derived from the pool's own per-job budget (_GPU_VRAM_PER_JOB_GB = 5.0 in
     # model_manager, itself measured from the ~1.6 GB forward + autoregressive
     # decode and the co-loaded WhisperX on the clone path), plus room for the
@@ -1951,7 +1981,7 @@ class OmniVoiceBackend(TTSBackend):
         gen_kw = dict(
             text=text,
             language=language if language and language != "Auto" else None,
-            instruct=kw.get("instruct"),
+            instruct=tag_safe_instruct(kw.get("instruct")),
             duration=kw.get("duration"),
             num_step=kw.get("num_step", 16),
             guidance_scale=kw.get("guidance_scale", 2.0),
@@ -2035,7 +2065,7 @@ class OmniVoiceBackend(TTSBackend):
 
         gen_kw = dict(
             language=kw.get("language"),
-            instruct=kw.get("instruct"),
+            instruct=tag_safe_instruct(kw.get("instruct")),
             duration=kw.get("duration"),
             speed=kw.get("speed", 1.0),
             denoise=kw.get("denoise", True),
@@ -3239,11 +3269,15 @@ class MLXAudioBackend(TTSBackend):
     def _ensure_loaded(self):
         if self._model is not None:
             return
-        from services.local_model_paths import get as local_model_path, validate
+        from services.local_model_paths import (
+            get as local_model_path, loading_fingerprint, note_loaded, validate,
+        )
+        local_fingerprint = None
         if (not os.environ.get("OMNIVOICE_MLX_AUDIO_MODEL", "").strip()
                 and self._model_id
                 and self._model_id == local_model_path("tts", "mlx-audio")):
             validate("tts", "mlx-audio", self._model_id)
+            local_fingerprint = loading_fingerprint(self._model_id)
         if self._curated_key() == "melotts":
             _ensure_melotts_text_frontend()
         elif self._curated_key() == "kokoro":
@@ -3275,6 +3309,8 @@ class MLXAudioBackend(TTSBackend):
             # this worker; the installed model ships the same voices/ folder.
             model.repo_id = self._model_id
         self._model = model
+        if local_fingerprint is not None:
+            note_loaded("tts", "mlx-audio", self._model_id, local_fingerprint)
 
     def _is_voice_design(self) -> bool:
         """Whether the loaded model builds a voice from a text description.
@@ -3607,8 +3643,22 @@ class CosyVoiceBackend(TTSBackend):
             raise RuntimeError(f"CosyVoice unavailable: {msg}")
         from cosyvoice.cli.cosyvoice import AutoModel  # type: ignore[import-not-found]
         model_dir = self._resolved_model_dir()
+        checkpoint = os.path.realpath(model_dir)
+        fingerprint = None
+        try:
+            from core.model_fingerprint import tree_fingerprint
+            fingerprint = tree_fingerprint(checkpoint)
+        except Exception as err:  # noqa: BLE001 - optional recovery proof
+            logger.debug("CosyVoice recovery fingerprint unavailable: %s", type(err).__name__)
         logger.info("Loading CosyVoice from %s", model_dir)
         self._model = AutoModel(model_dir=model_dir)
+        try:
+            self._model._voicestudio_checkpoint = checkpoint
+            if fingerprint is not None and tree_fingerprint(checkpoint) != fingerprint:
+                fingerprint = None
+            self._model._voicestudio_weights_fingerprint = fingerprint
+        except Exception:  # noqa: BLE001 - optional recovery metadata
+            logger.debug("Could not attach CosyVoice recovery identity", exc_info=True)
 
     def generate(self, text: str, **kw) -> torch.Tensor:
         language = self._check_language(kw.get("language"))
@@ -4433,7 +4483,7 @@ def list_backends(*, include_hidden: bool = False) -> list[dict]:
             isolation = "subprocess"
         else:
             isolation = "in-process"
-        from services.engine_routing import resolve_routing, runtime_compute_profile, uses_parent_torch
+        from services.engine_routing import parent_self_test_policy, resolve_routing, runtime_compute_profile, uses_parent_torch
         try:
             profile = runtime_compute_profile(cls, caps)
         except Exception:
@@ -4448,6 +4498,8 @@ def list_backends(*, include_hidden: bool = False) -> list[dict]:
                 **resolve_routing(
                     compat, caps, floor,
                     parent_torch=uses_parent_torch(cls),
+                    parent_process=not getattr(cls, "_is_subprocess_isolated", False),
+                    self_test_policy=parent_self_test_policy(cls),
                 ),
                 "runtime_backend": None,
                 "runtime_device_index": None,

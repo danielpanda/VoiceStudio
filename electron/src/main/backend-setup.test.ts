@@ -118,6 +118,7 @@ vi.mock('./setup-downloads', async (importOriginal) => ({
 }));
 import {
   BackendSupervisor,
+  bundledGgufBinPath,
   bundledUvPath,
   bundledWebUiPath,
   isExpectedPipeClose,
@@ -284,6 +285,26 @@ it('passes a live nested-operation drain descriptor to POSIX managed backends', 
   expect(windows.drainFd).toBeNull();
   expect(windows.stdio).toEqual(['pipe', 'pipe', 'pipe']);
   expect(windows.env.OMNIVOICE_DESKTOP_DRAIN_FD).toBeUndefined();
+});
+
+it('leaves the serial weight-load default to the backend so .env can override it', () => {
+  const saved = process.env.HF_DEACTIVATE_ASYNC_LOAD;
+  try {
+    delete process.env.HF_DEACTIVATE_ASYNC_LOAD;
+    for (const platform of ['win32', 'linux', 'darwin'] as const) {
+      const env = managedBackendSpawnOptions(3900, 'auto', platform).env;
+      expect(env.HF_DEACTIVATE_ASYNC_LOAD).toBeUndefined();
+    }
+    // An inherited value passes through once, never duplicated under another casing.
+    process.env.HF_DEACTIVATE_ASYNC_LOAD = '0';
+    const env = managedBackendSpawnOptions(3900, 'auto', 'win32').env;
+    const keys = Object.keys(env).filter((k) => k.toUpperCase() === 'HF_DEACTIVATE_ASYNC_LOAD');
+    expect(keys).toHaveLength(1);
+    expect(env.HF_DEACTIVATE_ASYNC_LOAD).toBe('0');
+  } finally {
+    if (saved === undefined) delete process.env.HF_DEACTIVATE_ASYNC_LOAD;
+    else process.env.HF_DEACTIVATE_ASYNC_LOAD = saved;
+  }
 });
 
 it('recognizes only expected child-pipe close errors', () => {
@@ -1022,6 +1043,24 @@ it('keeps a web UI directory the user pinned themselves', () => {
   expect(managedBackendSpawnOptions(3900).env.OMNIVOICE_FRONTEND_DIST).toBe('/custom/web');
 });
 
+it('points the GGUF engine at the runtime packaged with this app version', () => {
+  // #4051: the backend runs from a staged copy of backend/ that has no bin/.
+  vi.stubEnv('OMNIVOICE_GGUF_BIN_DIR', '');
+  stubResourcesPath(join('/opt', 'VoiceStudio', 'resources'));
+
+  const { env } = managedBackendSpawnOptions(3900);
+
+  expect(env.OMNIVOICE_GGUF_BIN_DIR).toBe(join('/opt', 'VoiceStudio', 'resources', 'bin'));
+  expect(bundledGgufBinPath()).toBe(env.OMNIVOICE_GGUF_BIN_DIR);
+});
+
+it('keeps a GGUF runtime directory the user pinned themselves', () => {
+  vi.stubEnv('OMNIVOICE_GGUF_BIN_DIR', '/custom/bin');
+  stubResourcesPath(join('/opt', 'VoiceStudio', 'resources'));
+
+  expect(managedBackendSpawnOptions(3900).env.OMNIVOICE_GGUF_BIN_DIR).toBe('/custom/bin');
+});
+
 it('exposes the current process signal separately from the durable crash journal', async () => {
   vi.useFakeTimers();
   vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')));
@@ -1270,9 +1309,7 @@ describe('falling back to the CPU build', () => {
       }),
     );
     let finish = () => {};
-    mocks.install.mockImplementation(
-      () => new Promise<void>((resolve) => (finish = resolve)),
-    );
+    mocks.install.mockImplementation(() => new Promise<void>((resolve) => (finish = resolve)));
     const supervisor = new BackendSupervisor();
     onTestFinished(() => supervisor.shutdown());
     await supervisor.start();
@@ -1428,6 +1465,78 @@ describe('falling back to the CPU build', () => {
     expect(process.env.OMNIVOICE_TORCH_VARIANT).toBeUndefined();
     expect(mocks.saveTorchVariant).not.toHaveBeenCalled();
   });
+});
+
+it('reports the failed dependency host instead of the earlier large Torch download', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('no backend')));
+  vi.stubEnv('OMNIVOICE_BACKEND_CMD', '');
+  vi.stubEnv('VOICESTUDIO_SKIP_BACKEND', '');
+  mocks.hosts.mockResolvedValue(new Map([['torch', 'download-r2.pytorch.org']]));
+  let supervisor: BackendSupervisor;
+  mocks.install.mockImplementation(async () => {
+    const internal = supervisor as unknown as {
+      pushLog(stream: 'out' | 'err', line: string, fromChild?: boolean): void;
+    };
+    internal.pushLog('err', 'Downloading torch (3.2 GiB)', true);
+    internal.pushLog('err', 'torch 3.0 GiB/3.2 GiB', true);
+    internal.pushLog('err', 'Failed to fetch:', true);
+    internal.pushLog(
+      'err',
+      '  `https://files.pythonhosted.org/packages/hash/antlr4-python3-runtime-4.9.3.tar.gz`',
+      true,
+    );
+    internal.pushLog(
+      'err',
+      'error sending request for url (https://files.pythonhosted.org/packages/hash/antlr4-python3-runtime-4.9.3.tar.gz)',
+      true,
+    );
+    internal.pushLog('err', 'dns error: No such host is known. (os error 11001)', true);
+    throw new Error(
+      'A download server returned a temporary error (Runtime setup exited with code 1).',
+      {
+        cause: Object.assign(new Error('Runtime setup exited with code 1'), {
+          stderr:
+            'error sending request for url (https://files.pythonhosted.org/packages/hash/antlr4-python3-runtime-4.9.3.tar.gz)\ndns error',
+        }),
+      },
+    );
+  });
+  supervisor = new BackendSupervisor();
+  onTestFinished(() => supervisor.shutdown());
+  await supervisor.start();
+  await supervisor.setupRuntime();
+  expect(supervisor.status.failure?.downloadHost).toBe('files.pythonhosted.org');
+  expect(supervisor.status.failure?.downloadedBytes).toBeUndefined();
+});
+
+it('reports a later mirror stall using its current host rather than an earlier failure', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('no backend')));
+  vi.stubEnv('OMNIVOICE_BACKEND_CMD', '');
+  vi.stubEnv('VOICESTUDIO_SKIP_BACKEND', '');
+  mocks.hosts.mockResolvedValue(new Map([['scipy', 'mirrors.aliyun.com']]));
+  let supervisor: BackendSupervisor;
+  mocks.install.mockImplementation(async () => {
+    const internal = supervisor as unknown as {
+      pushLog(stream: 'out' | 'err', line: string, fromChild?: boolean): void;
+    };
+    internal.pushLog(
+      'err',
+      'error sending request for url (https://files.pythonhosted.org/packages/first.whl)',
+      true,
+    );
+    internal.pushLog('err', 'Downloading scipy (10 MiB)', true);
+    internal.pushLog('err', 'scipy 5 MiB/10 MiB', true);
+    throw Object.assign(
+      new Error('Download timed out: no data for 120 s from mirrors.aliyun.com'),
+      { code: 'DOWNLOAD_STALLED' },
+    );
+  });
+  supervisor = new BackendSupervisor();
+  onTestFinished(() => supervisor.shutdown());
+  await supervisor.start();
+  await supervisor.setupRuntime();
+  expect(supervisor.status.failure?.downloadHost).toBe('mirrors.aliyun.com');
+  expect(supervisor.status.failure?.downloadedBytes).toBe(5 * 1024 ** 2);
 });
 
 it('does not take crash context from a backend process that was replaced', async () => {

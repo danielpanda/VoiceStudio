@@ -151,12 +151,15 @@ export function toGenerateForm(
   )?.tts?.active,
 ): FormData {
   const form = new FormData();
+  // A pinned engine wins: its own step range applies, and /generate renders on it.
+  const targetEngine = input.engine || engineId;
+  if (input.engine) form.append('engine', input.engine);
   form.append('text', input.text);
   if (input.seed !== undefined && Number.isInteger(input.seed))
     form.append('seed', String(input.seed));
   // Auto must be explicit: omission inherits the saved profile's default.
   if (input.language) form.append('language', input.language);
-  form.append('num_step', String(effectiveSamplingSteps(input.steps, engineId)));
+  form.append('num_step', String(effectiveSamplingSteps(input.steps, targetEngine)));
   form.append('wav_bits', String(input.wavBits ?? 16));
   form.append('effect_preset', input.effectPreset ?? 'broadcast');
   if (input.presetVoice) form.append('preset_voice', input.presetVoice);
@@ -424,10 +427,11 @@ export async function generateClone(
   // budget read still in flight (just after connecting) is awaited briefly so
   // an operator-raised timeout is not missed.
   if (generateBudgetPending()) await generateBudgetSettled(2_000);
-  const backstop = setTimeout(
-    forwardAbort,
-    generateAbortMs(input.text.length, reportedGenerateBudget()),
-  );
+  let deadlineReached = false;
+  const backstop = setTimeout(() => {
+    deadlineReached = true;
+    controller.abort();
+  }, generateAbortMs(input.text.length, reportedGenerateBudget()));
   const finishActivity = beginAppActivity('synthesis');
   try {
     const res = await apiFetch('/generate', {
@@ -437,6 +441,15 @@ export async function generateClone(
     });
     const blob = await readAudioBody(res, opts.onProgress);
     return { blob, ...parseGenerateHeaders(res.headers) };
+  } catch (error) {
+    // Fetch uses AbortError for both cancellation and our internal deadline.
+    // Keep actual caller cancellation local while reporting a stalled request.
+    if (deadlineReached && !opts.signal?.aborted && isAbortError(error)) {
+      const timeout = new Error(i18next.t('tts_errors.timeout'));
+      timeout.name = 'TimeoutError';
+      throw timeout;
+    }
+    throw error;
   } finally {
     finishActivity();
     clearTimeout(backstop);

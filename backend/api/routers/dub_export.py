@@ -14,7 +14,7 @@ import zipfile
 from functools import partial
 from pathlib import Path, PureWindowsPath
 from tempfile import TemporaryFile
-from typing import Annotated, BinaryIO, Optional
+from typing import Annotated, Any, BinaryIO, Optional
 
 from core.config import DUB_DIR
 from core.http_headers import content_disposition
@@ -22,7 +22,8 @@ from core.logging_utils import log_safe
 from core.path_security import UnsafePath, portable_filename, resolve_within
 from core.tasks import task_manager
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response, Depends
-from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
 from starlette.types import Receive, Scope, Send
 from services.ffmpeg_utils import (
@@ -355,23 +356,38 @@ async def get_job(job_id: str):
     return row
 
 
+class PersistedJobEvent(BaseModel):
+    seq: int
+    created_at: float
+    payload: str
+
+
+class JobEventWatermark(BaseModel):
+    seq: int
+    created_at: Optional[float]
+
+
+class PersistedJobEvents(BaseModel):
+    job: dict[str, Any]
+    events: list[PersistedJobEvent]
+    event_watermark: JobEventWatermark
+
+
 @router.get("/jobs/{job_id}/events")
-async def list_job_events(job_id: str, after_seq: int = 0, limit: int = 500):
-    """Persisted SSE tail. Strict ascending seq so the client can stitch
-    it onto a live feed (which starts above the last returned seq).
+async def list_job_events(job_id: str, after_seq: int = 0, limit: int = 500) -> PersistedJobEvents:
+    """A bounded ascending SSE page and true retained-tail watermark.
+
+    Job, page and watermark share one read snapshot. The watermark is not
+    limited by the page, so it can fence older history before a live feed.
     """
     from core import job_store
-    row = job_store.get(job_id)
-    if not row:
+    page = await run_in_threadpool(job_store.event_page, job_id, after_seq, limit)
+    if page is None:
         raise HTTPException(
             status_code=404,
             detail="No job with that id. It may have expired, been deleted, or the server restarted before it was persisted — check the dub history in the sidebar.",
         )
-    limit = max(1, min(2000, int(limit)))
-    return {
-        "job": row,
-        "events": job_store.events_since(job_id, after_seq=after_seq, limit=limit),
-    }
+    return PersistedJobEvents(**page)
 
 
 @router.post("/tasks/cancel/{task_id}")
@@ -1777,7 +1793,7 @@ async def dub_qc_pass(job_id: str, lang: str = Query(None), drift_threshold: flo
         )
         from services.model_manager import _get_gpu_pool
         recognized, engine_id = await run_transcribe_guarded(
-            _get_gpu_pool(), _recognize, what="QC",
+            _get_gpu_pool(), _recognize, what="QC", audio_path=wav_path,
         )
     except ASRTimeoutError as e:
         # Backend is alive; ASR just couldn't finish in time. 504, not 500/connection.
@@ -2060,6 +2076,30 @@ def _fitted_cue_times(job: dict, lang: str | None) -> list | None:
         return None
     from services.fitted_subtitles import fitted_cues
     return fitted_cues(job.get("segments", []), entry["plan"])
+
+
+@router.get("/dub/txt/{job_id}", response_class=PlainTextResponse)
+def dub_export_txt(
+    job_id: str,
+    lang: str = Query(None, description="Track language code; uses the same stored transcript as SRT, without cue numbers or timestamps."),
+) -> PlainTextResponse:
+    _job_dir_or_400(job_id)
+    lang = _safe_lang_or_400(lang)
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    # Preserve the editor's stored text before generation and each generated
+    # language afterward, exactly as subtitle exports do. No ASR/TTS is run.
+    lines = [(segment.get("text") or "").strip() for segment in _segments_for_lang(job, lang)]
+    lines = [line for line in lines if line]
+    if not lines:
+        raise HTTPException(status_code=400, detail="No transcript segments available")
+    base_name = os.path.splitext(job.get("filename", "video"))[0]
+    return PlainTextResponse(
+        content="\n".join(lines) + "\n",
+        media_type="text/plain",
+        headers={"Content-Disposition": content_disposition(portable_filename(f"transcript_{base_name}.txt", "transcript"))},
+    )
 
 
 @router.get("/dub/srt/{job_id}")

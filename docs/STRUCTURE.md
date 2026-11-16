@@ -35,9 +35,12 @@ VoiceStudio/
 │   ├── api/routers/             45 routers, auto-included; HTTP/WS adaptation stays thin here
 │   │   └── setup/               setup-wizard endpoints and model acquisition
 │   ├── core/                    shared infrastructure: configuration, persistence, job/event plumbing,
-│   │                            auth and CSRF, safe paths, analytics consent, version and diagnostics
-│   ├── services/                131 modules of business logic spanning speech, dubbing, DSP, GPU dispatch,
+│   │                            auth and CSRF, safe paths, model artifact fingerprints, analytics consent,
+│   │                            version and diagnostics
+│   │   └── asr_budget.py        duration-based transcription budget shared with MCP
+│   ├── services/                137 modules of business logic spanning speech, dubbing, DSP, GPU dispatch,
 │   │                            engine selection and loaded-model ownership
+│   │   └── asr_timing.py        inherited ASR execution clocks without media dependencies
 │   ├── engines/                 per-engine adapters: audiocpp, confucius4, cosyvoice_gguf,
 │   │                            cosyvoice_subprocess, dots_tts, indextts, ming_tts, moss_sfx,
 │   │                            moss_tts_nano_subprocess, moss_tts_v15, omnivoice_gguf, omnivoice_subprocess, pockettts,
@@ -54,8 +57,8 @@ VoiceStudio/
 │   ├── src/main/                lifecycle, backend supervisor, runtime setup, updater, native IPC
 │   ├── src/preload/             typed contextBridge → window.voicestudio
 │   ├── src/renderer/            desktop React app: routes/, features/, components/, i18n/locales/
-│   ├── src/shared/              modules shared by the desktop and browser builds (api/, i18n/,
-│   │                            store/, ui/, utils/) — not a runnable app
+│   ├── src/shared/              modules shared by the desktop and browser builds (api/, store/,
+│   │                            utils/) — not a runnable app
 │   ├── tests/                   packaged-app, installer and workflow smoke tests
 │   ├── build/                   packaging inputs: icons, entitlements, Info.plist
 │   ├── scripts/                 dev launcher, AppImage update-info embedding
@@ -80,7 +83,6 @@ VoiceStudio/
 │   ├── conftest.py              redirects OMNIVOICE_DATA_DIR to disposable state for the whole session
 │   ├── backend/ / scripts/      path-shaped coverage for those source areas
 │   ├── smoke/                   quick end-to-end gates; isolated CI job runs with HF_HUB_OFFLINE=1
-│   ├── evals/                   evals.yml-driven output-quality checks
 │   ├── probe/ / fixtures/       diagnostic probes and reusable inputs
 │   └── frontend/                retained node:test suite for utilities and developer tooling
 │
@@ -129,10 +131,20 @@ VoiceStudio/
 │                                   DB + HF cache live here when running via compose
 │
 ├── .github/workflows/           ⟵ ci, electron-build, electron-release, docker, security,
-│                                   docs-drift, evals, install-smoke, build-omnivoice-tts,
+│                                   docs-drift, install-smoke, build-omnivoice-tts,
 │                                   cla, commit-identity, cosyvoice-dependencies
 └── .git/
 ```
+
+The shared-code retirement tracked in #2603 removes the unused legacy update
+toast, its check/install/version helpers, and the unused legacy update-busy
+helper with its exclusive test. `shared/utils/updater.js` retains
+the release-list adapter used by the shared releases store. Electron's updater
+remains in `src/main/updater.ts`, with its title-bar control and Settings screen
+under `src/renderer/src/`. Restart protection uses the renderer's
+`lib/update-actions.ts`, app activity, and backend job status. Each remaining
+shared module needs a fresh consumer audit before retirement; the original
+cleanup inventory is historical.
 
 ## Rules of the root
 

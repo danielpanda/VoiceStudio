@@ -13,6 +13,7 @@ import androidx.work.*
 import com.voicestudio.mobile.l10n.L10n
 import com.voicestudio.mobile.local.*
 import com.voicestudio.mobile.network.ClientFailure
+import com.voicestudio.mobile.network.DiagnosticInput
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.serialization.Serializable
@@ -20,6 +21,29 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+
+/** The production transfer's no-progress observer, separate from network ownership. */
+internal suspend fun monitorModelDownloadStalls(
+    originalConsent:CompanionDiagnosticObservation?,
+    progress:()->DownloadProgress?,
+    observeConsent:()->CompanionDiagnosticObservation?=AutomaticDiagnostics::observeConsent,
+    report:(DiagnosticInput,CompanionDiagnosticObservation?)->Unit=AutomaticDiagnostics::capture,
+    now:()->Long=android.os.SystemClock::elapsedRealtime,
+    pause:suspend ()->Unit={delay(30_000)},
+) {
+    val stalls=DownloadStallObservation()
+    var previousConsent=observeConsent()
+    while(currentCoroutineContext().isActive) {
+        val observation=observeConsent()
+        if(observation!=previousConsent) {
+            stalls.observe(null,now());previousConsent=observation
+        }
+        val owner=originalConsent?.takeIf {it==observation}
+        if(stalls.observe(progress().takeIf {owner!=null},now()))
+            report(DiagnosticInput(category="install_stalled",stage="download",reason="no_progress"),owner)
+        pause()
+    }
+}
 
 /** The UI submits durable intents; services/workers, never a ViewModel, own transfers. */
 object ModelDownloadJobs {
@@ -39,13 +63,23 @@ object ModelDownloadJobs {
         write(context,saved.filterNot {it.model==model.id}+item)
         schedule(context,item,model.totalBytes)
     }
+    private fun requiredNetwork(mobile: Boolean): NetworkRequest = NetworkRequest.Builder()
+        .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        // Builder defaults exclude VPNs even when mobile data is allowed.
+        .removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+        .apply {
+            if(!mobile) {
+                addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+                addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
+                addTransportType(NetworkCapabilities.TRANSPORT_VPN)
+            }
+        }.build()
     private fun schedule(context: Context,item: IntentRecord,total: Long) {
         PhoneRuntime.get(context).downloads.scheduled(item.model,total,if(item.mobile) "waiting_network" else "waiting")
         if(Build.VERSION.SDK_INT>=34) {
             val extras=PersistableBundle().apply {putString("model",item.model)}
-            val network=NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).apply {
-                if(!item.mobile) {addTransportType(NetworkCapabilities.TRANSPORT_WIFI);addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)}
-            }.build()
+            val network=requiredNetwork(item.mobile)
             val info=JobInfo.Builder(item.jobID,ComponentName(context,ModelDownloadService::class.java))
                 .setUserInitiated(true).setRequiredNetwork(network).setEstimatedNetworkBytes(total,0).setExtras(extras).build()
             if(context.getSystemService(JobScheduler::class.java).schedule(info)!=JobScheduler.RESULT_SUCCESS) {
@@ -53,10 +87,33 @@ object ModelDownloadJobs {
                 throw ClientFailure("mobile.local.download_failed")
             }
         } else {
-            val request=OneTimeWorkRequestBuilder<ModelDownloadWorker>().setInputData(workDataOf("model" to item.model))
-                .setConstraints(Constraints.Builder().setRequiredNetworkType(if(item.mobile) NetworkType.CONNECTED else NetworkType.UNMETERED).build()).build()
-            WorkManager.getInstance(context).enqueueUniqueWork("model:${item.model}",ExistingWorkPolicy.KEEP,request)
+            scheduleWorker(context,item)
         }
+    }
+    private fun scheduleWorker(context: Context,item: IntentRecord) {
+            val manager=WorkManager.getInstance(context)
+            val networkType=if(item.mobile) NetworkType.CONNECTED else NetworkType.UNMETERED
+            val request=OneTimeWorkRequestBuilder<ModelDownloadWorker>().setInputData(workDataOf("model" to item.model))
+                .setConstraints(Constraints.Builder().setRequiredNetworkType(networkType).build()).build()
+            val previous=manager.getWorkInfosForUniqueWork("model:${item.model}")
+            // Complete on WorkManager's query callback; never block the UI or
+            // introduce a separate transfer/network polling owner.
+            previous.addListener({
+                try {
+                    val infos=previous.get()
+                    synchronized(this) {
+                        if(read(context).firstOrNull {it.model==item.model}==item) {
+                            val stale=infos.any {!it.state.isFinished&&it.constraints.requiredNetworkType!=networkType}
+                            manager.enqueueUniqueWork("model:${item.model}",if(stale) ExistingWorkPolicy.REPLACE else ExistingWorkPolicy.KEEP,request)
+                        }
+                    }
+                } catch(_:Exception) {
+                    synchronized(this) {
+                        if(read(context).firstOrNull {it.model==item.model}==item)
+                            pauseInBackground(context,item.model,"mobile.local.download_failed")
+                    }
+                }
+            },java.util.concurrent.Executor {it.run()})
     }
     /** Called only when the phone UI opens. Existing OS jobs retain ownership. */
     fun restore(context: Context,models: List<PhoneModel>,onFailure: (Throwable)->Unit = {}) {
@@ -71,7 +128,7 @@ object ModelDownloadJobs {
                 }
                 if(item.paused) {downloads.paused(item.model,model.totalBytes,item.error);continue}
                 if(PhoneRuntime.get(context).downloads.installed(model)) {finished(context,item.model);continue}
-                if(Build.VERSION.SDK_INT<34||scheduler.getPendingJob(item.jobID)==null) schedule(context,item,model.totalBytes)
+                if(Build.VERSION.SDK_INT<34||scheduler.getPendingJob(item.jobID)?.requiredNetwork!=requiredNetwork(item.mobile)) schedule(context,item,model.totalBytes)
                 else PhoneRuntime.get(context).downloads.scheduled(item.model,model.totalBytes,if(item.mobile) "waiting_network" else "waiting")
             } catch(e:CancellationException) {throw e}
             catch(e:Exception) {onFailure(e as? ClientFailure ?: ClientFailure("mobile.local.download_failed"))}
@@ -108,12 +165,24 @@ object ModelDownloadJobs {
     internal suspend fun run(context: Context,id: String) {
         val job=currentCoroutineContext().job
         active.putIfAbsent(id,job)?.let {previous -> previous.join();run(context,id);return}
+        val diagnosticConsent=AutomaticDiagnostics.observeConsent()
         try {
             val item=read(context).firstOrNull {it.model==id&&!it.paused} ?: return
             val model=withContext(Dispatchers.IO) {context.assets.open("models.json").bufferedReader().use {ModelCatalog.decode(it.readText()).models.firstOrNull {m->m.id==id&&modelPin(m).identity==item.pin}}}
                 ?: throw ClientFailure("mobile.local.catalogue_failed")
             currentCoroutineContext().ensureActive()
-            PhoneRuntime.get(context).downloads.download(model,item.mobile);finished(context,id)
+            coroutineScope {
+                val downloads = PhoneRuntime.get(context).downloads
+                val observer = launch {
+                    monitorModelDownloadStalls(diagnosticConsent,{downloads.progress.value[id]})
+                }
+                try {downloads.download(model,item.mobile);finished(context,id)}
+                finally {observer.cancel()}
+            }
+        } catch(e:CancellationException) {throw e}
+        catch(e:Exception) {
+            AutomaticDiagnostics.captureObservedFailure(e,diagnosticConsent,stage="download")
+            throw e
         } finally {active.remove(id,job)}
     }
     internal suspend fun notification(context: Context,id: String): Notification {

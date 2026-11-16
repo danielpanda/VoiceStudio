@@ -66,6 +66,8 @@ vi.mock('./site-browser', () => ({ registerSiteBrowser: vi.fn() }));
 import { CHANNELS, registerIpc } from './ipc';
 import type { BackendSupervisor } from './backend';
 import { decodeDownloadFailure } from '../shared/download-failure';
+import { diagnosticRejectionEpoch, runDiagnosticOperation, trackDiagnosticOperations } from './diagnostic-operation';
+import type { DiagnosticState } from '../preload/diagnostics';
 
 let directory: string;
 const event = { sender: owner.webContents, senderFrame: owner.webContents.mainFrame };
@@ -88,6 +90,29 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   await rm(directory, { recursive: true, force: true });
+});
+
+it('observes each actual main IPC operation before its asynchronous descendants start', async () => {
+  let epoch: string | null = null;
+  const reports = { status: () => ({ grant_epoch: epoch }) as DiagnosticState };
+  const stop = trackDiagnosticOperations();
+  try {
+    registerIpc(
+      { subscribe: () => () => {}, restart: async () => { await Promise.resolve(); } } as unknown as BackendSupervisor,
+      () => owner as never,
+      async () => {},
+      (work) => runDiagnosticOperation(reports, work),
+    );
+    const invoke = native.handlers.get(CHANNELS.backendRestart)!;
+    const old = invoke(event, undefined);
+    epoch = 'a'.repeat(32);
+    await old;
+    expect(diagnosticRejectionEpoch(old, reports)).toBeNull();
+    const fresh = invoke(event, undefined);
+    epoch = 'b'.repeat(32);
+    await fresh;
+    expect(diagnosticRejectionEpoch(fresh, reports)).toBe('a'.repeat(32));
+  } finally { stop(); }
 });
 
 const saves = [
@@ -166,3 +191,29 @@ it.each([CHANNELS.backendSetupDiagnostics, CHANNELS.backendCheckSetupConnection]
     );
   },
 );
+
+it('writes exact timestamp-free UTF-8 transcript bytes with GET and keeps cancellation free of requests', async () => {
+  const { net, dialog } = await import('electron');
+  const content = 'Bonjour & <monde>\nÀ bientôt\n';
+  vi.mocked(net.fetch).mockResolvedValueOnce(
+    new Response(content, { headers: { 'Content-Type': 'text/plain; charset=utf-8' } }),
+  );
+  native.savePath = join(directory, 'transcript.txt');
+  const request = { url: '/api/dub/txt/job?lang=fr', suggestedName: 'transcript.txt' };
+  await expect(native.handlers.get(CHANNELS.filesSaveAudio)!(event, request)).resolves.toEqual({
+    canceled: false,
+    path: native.savePath,
+  });
+  expect(await readFile(native.savePath)).toEqual(Buffer.from(content, 'utf8'));
+  expect(net.fetch).toHaveBeenLastCalledWith(
+    'http://127.0.0.1:3900/dub/txt/job?lang=fr',
+    expect.objectContaining({ method: 'GET' }),
+  );
+  const sent = vi.mocked(net.fetch).mock.calls.length;
+  vi.mocked(dialog.showSaveDialog).mockResolvedValueOnce({ canceled: true, filePath: '' });
+  await expect(native.handlers.get(CHANNELS.filesSaveAudio)!(event, request)).resolves.toEqual({
+    canceled: true,
+  });
+  expect(net.fetch).toHaveBeenCalledTimes(sent);
+  expect(await readFile(native.savePath)).toEqual(Buffer.from(content, 'utf8'));
+});

@@ -197,7 +197,7 @@ VoiceStudio/
 │       ├── main/            # Electron main process (IPC, updater, runtime)
 │       ├── preload/         # Narrow renderer bridges
 │       ├── renderer/src/    # App shell, features, shadcn ui/, i18n catalog
-│       └── shared/          # Pages, components, hooks, Zustand store/, i18n
+│       └── shared/          # Legacy modules the renderer still imports (being retired, #2603)
 ├── native/                  # Rust desktop helper used by Electron
 ├── deploy/                  # Dockerfile, compose, install worker
 ├── docs/                    # User, install, release and design docs
@@ -312,15 +312,15 @@ one. The rules:
 
 - **Size caps:** **soft 300 lines**, **hard 500 lines** per component file
   (`.jsx`/`.tsx`). Anything over 500 lines must be split.
-- **Pages are thin orchestrators.** A file in `electron/src/shared/pages/` is just
-  layout + routing + state wiring that composes feature components — no inline
-  sub-component over ~50 lines.
-- **One component per file.** Co-locate `Foo.jsx` + `Foo.test.jsx` together in a
-  per-page feature folder under `electron/src/shared/components/` (e.g.
-  `components/settings/`, `components/dub/`). Style with utilities + shadcn
-  first (see the CSS rule above).
-- **Shared bits go in a `primitives/` folder** inside the feature folder
-  (`components/settings/primitives/` is the existing example).
+- **Pages are thin orchestrators.** A page in `electron/src/renderer/src/features/<feature>/`
+  (routed from `electron/src/renderer/src/routes/`) is just layout + routing + state
+  wiring that composes feature components — no inline sub-component over ~50 lines.
+- **One component per file.** Co-locate `foo.tsx` + `foo.test.tsx` together in the
+  feature folder under `electron/src/renderer/src/features/` (e.g. `features/settings/`,
+  `features/dub/`). Style with utilities + shadcn first (see the CSS rule above).
+- **Shared bits go in a subfolder** inside the feature folder, or in
+  `electron/src/renderer/src/components/` when several features use them.
+  New UI never goes in `electron/src/shared/`.
 - **Enforced in review, not by lint:** `bun run lint` (oxlint) has no
   `max-lines` rule, so reviewers apply the caps.
 
@@ -387,7 +387,7 @@ bun run --cwd electron build
 bun run --cwd electron test:desktop-ui
 
 # The bundled `voicestudio` command, built as installers build it (needs uv).
-# The Desktop UI job runs this on all three systems.
+# CI runs this on all three systems (Release smoke on macOS and Linux, Desktop UI on Windows).
 node electron/tests/cli-bundle-smoke.mjs
 
 # Offline renderer smokes (what CI runs): start the smoke server, then the runner.
@@ -404,7 +404,9 @@ OMNIVOICE_PORT=3999 VOICESTUDIO_UI_URL=http://localhost:3912 PLAYWRIGHT_CHANNEL=
 # with 500, with a network error, or with broken JSON. It fails on a spinner
 # left after requests settle, a button still greyed out after its write failed,
 # a failed write with no visible feedback, an uncaught error, or a
-# console.error. Fix the button; KNOWN_FINDINGS stays empty.
+# console.error. Fix the button; KNOWN_FINDINGS stays empty. A request pending
+# for 30 s (a hung backend or dev server) stops that fault mode at once with one
+# "stalled" finding naming the click or screen that started it.
 OMNIVOICE_PORT=3999 VOICESTUDIO_UI_URL=http://localhost:3912 \
   VOICESTUDIO_CRAWL_MODES=http-500 VOICESTUDIO_CRAWL_ROUTES=/clone \
   node electron/tests/ui-crawler.mjs
@@ -421,6 +423,12 @@ by content, so a re-run after an unrelated edit takes seconds. It needs Docker.
 The first run downloads container images and dependencies (as CI does); after
 that your code and results stay on your machine. CI is unchanged: `ci.yml`
 stays the gate.
+
+The module has its own dependency lockfile, `.dagger/uv.lock`; the root Python
+lockfile does not update it. When refreshing module dependencies, use the SDK
+matching `dagger.json`'s engine version and keep the generated `.dagger/sdk/`
+directory untracked. `tests/test_dependency_security_floors.py` checks both
+lockfiles against reviewed security fixes.
 
 ```bash
 dagger call check             # all of the above, in parallel
@@ -486,7 +494,9 @@ Documentation-only and test-only changes skip runtime tests, desktop/mobile buil
 and Docker image rebuilds on pull requests and pushes to `main`. The required
 `Tests (backend + frontend)` check reports the explicit skip so branch protection
 still works. Mixed changes, workflow/build configuration, dependencies and bundled
-app icons still run their normal checks; unknown or truncated change lists run
+app icons still run their normal checks, as do changes to the UI crawler's
+harness (`CI_HARNESS` in `.github/scripts/ci_scope.py`), so the crawler job checks
+its own changes; unknown or truncated change lists run
 all checks. Manual runs and scheduled audits remain full runs. CLA, commit identity
 and secret scanning still run. The same skip applies while a pull request's
 opener has not signed the CLA (see [Contribution licensing](#contribution-licensing)). Run changed tests locally before submitting a
@@ -501,19 +511,33 @@ test-only PR. Docker Hub overview edits still publish through the small
 - **First CI run from a fork:** a pull request from a fork waits for a
   maintainer to approve it (the `external-pr` environment) before CI starts.
   Branches in this repository start at once.
+- **Required check:** `Tests (backend + frontend)` is the one CI status `main`
+  requires. It waits for every job in `ci.yml` and fails if any of them failed,
+  so a red UI crawler, Desktop UI or release smoke blocks the merge too.
+- **Release smoke:** every pull request that can affect the desktop app packages
+  it on Linux and macOS the way a release does, without installers or signing
+  credentials: `electron-builder --dir` (which builds the bundled `voicestudio`
+  command and the native helper), the release's packaging contract, glibc floor
+  and bundle signature checks, the packaged startup smoke test (on Linux through
+  the `voicestudio` entry, as the AppImage starts it) and
+  `electron/tests/cli-bundle-smoke.mjs`.
 - **CI scope:** the Electron-only jobs (UI crawler, Desktop UI, Linux native
-  package, and `Tests (Electron)` plus `Electron renderer smokes`, the Electron halves of `Tests (backend + frontend)`) are skipped on a
+  package, release smoke, `Tests (Electron)` and `Electron renderer smokes`) are skipped on a
   pull request whose every changed file is an *edit or addition* under `backend/`
-  (except `backend/assets/`), `omnivoice/`, `docs/` or `mobile/`, a Python file under `tests/` or `scripts/`,
+  (except `backend/assets/`), `omnivoice/`, `docs/` or `mobile/`, a Python file under `tests/` or `scripts/`
+  (except the scripts the desktop build runs or ships: `freeze_cli.py`,
+  `smoke_windows_rocm.py`, `check_glibc_floor.py`),
   a root `*.md`, `Makefile`, or a workflow other than `ci.yml` and
   `electron-*.yml`. Any other path (including `pyproject.toml`, `uv.lock`, `package.json`,
   `bun.lock` and shared test fixtures), any file that is not a plain edit or addition (**deleted, renamed**, copied or type-changed), 3,000 or
   more files, and every push to `main` run the full matrix; so does a failed
-  detection. Skipped jobs show as skipped in the PR. A merge-queue run applies
-  the same rule to the queue commit against its base (300 files or more run
-  everything). The rule is the `changes` job in `.github/workflows/ci.yml`.
+  detection. Skipped jobs show as skipped in the PR. If the merge queue is ever
+  turned on (it needs an organization-owned repository; see
+  `docs/RELEASING.md` → Merge queue), a queue run applies the same rule to the
+  queue commit against its base (300 files or more run everything). The rule is
+  the `changes` job in `.github/workflows/ci.yml`.
 - **Pass cache:** the heavy jobs in `ci.yml` (Python tests, the Electron jobs,
-  UI crawler, Desktop UI, smokes) and in `mobile.yml` (iOS, Android and their
+  UI crawler, Desktop UI, release smoke, smokes) and in `mobile.yml` (iOS, Android and their
   inference tests) skip their steps, and still pass, when their exact inputs
   already passed. Each job hashes the git entries (mode, content and path) of
   the files it reads, plus its workflow file and `.github/actions/ci-pass`; a
@@ -540,10 +564,12 @@ test-only PR. Docker Hub overview edits still publish through the small
   Platform-only features go behind an explicit opt-in (Settings toggle, env
   var, or CLI flag).
 - **i18n — every locale (hard rule):** every user-facing string goes through
-  `t('...')` and the key must exist in **every** file of the catalog the code
-  uses: `electron/src/shared/i18n/locales/` (checked by
-  `tests/test_locale_parity.py`) or `electron/src/renderer/src/i18n/locales/`
-  (checked by `bun run --cwd electron locale:check`). Translate; don't copy
+  `t('...')` and the key must exist in **every** file of the catalog:
+  `electron/src/renderer/src/i18n/locales/` (checked by
+  `tests/test_locale_parity.py` and `bun run --cwd electron locale:check`, which also fails on an
+  `en.json` key no code references; delete it from every locale, or add a
+  prefix to `ALLOWED_PREFIXES` in `electron/tests/locale-source-keys.mjs` if code
+  builds it dynamically). Translate; don't copy
   English into non-English locales. CI fails on hardcoded CJK outside the allowlist in
   `tests/test_no_hardcoded_cjk.py` (extend `_ALLOWED_FILES` with a
   justification for legitimate functional CJK).
@@ -560,7 +586,8 @@ test-only PR. Docker Hub overview edits still publish through the small
     restricted networks, skipped when the user set an endpoint
     (`backend/services/endpoint_race.py`); the dependency install's download
     of the packages pinned in `uv.lock`, from their locked URLs or the
-    regional mirror the user chose or the Auto region selected, including the
+    regional mirror the user chose or the Auto region selected (including a
+    hash-preserving PyPI failover after a confirmed transient origin failure), including the
     parallel multi-connection wheel prefetch
     (`electron/src/main/wheel-prefetch.ts`; owner-approved 2026-10-27); the
     Auto region's speed check, which reads the start of one locked wheel from
@@ -646,6 +673,21 @@ test-only PR. Docker Hub overview edits still publish through the small
   - Supermetry analytics only after a yes at the first-run consent prompt, asked before
     runtime setup on a fresh install so setup stage and failure code can be counted
     (`backend/core/analytics.py`, allowlisted content-free metadata).
+  - Automatic failure reports to Supermetry's app intake
+    (`https://app.supermetry.com/api/public/v1/app-events`, or the owner-configured
+    packaged destination `https://app.voicestudio.sh/api/public/v1/app-events`,
+    owner-set 2026-11-16) when build/runtime app
+    credentials are configured, otherwise the same existing public events endpoint,
+    only after the separate **Automatic error reports** opt-in (owner-approved
+    2026-11-14). Off by default, including for existing analytics users; metadata
+    follows `config/diagnostics.json`. Electron main owns desktop uploads even
+    when setup/backend fails; source/Docker and both native phones own their
+    respective consent. `SUPERMETRY_APP_HOST` is an explicit, default-unset operator
+    override; any other production host needs owner approval and documentation.
+    The separate `diagnostics.sessionPings` build flag remains off by default and
+    still requires diagnostics consent. Withdrawal stops delivery and invalidates queued reports.
+    No audio, text, exception messages, logs, user paths, credentials, screenshots
+    or crash dumps are uploaded; see `docs/electron-privacy.md`.
   - The GitHub star count (no credentials or referrer, refreshed every 20
     minutes while shown).
 

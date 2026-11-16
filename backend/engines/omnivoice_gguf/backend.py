@@ -67,6 +67,8 @@ import urllib.error
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
+from services.expression import OMNIVOICE_INLINE_TAGS
+
 from .compute import BACKEND_ENV as BACKEND_ENV, DEVICE_ENV as DEVICE_ENV
 from .quant_cache import resolve_installed_pair
 
@@ -83,6 +85,12 @@ _PKG_DIR = Path(__file__).resolve().parent
 #: Repo root — used to find ``bin/omnivoice-tts-*`` and
 #: ``bin/checksums.sha256``. backend/engines/omnivoice_gguf/ → root.
 _REPO_ROOT = _PKG_DIR.parent.parent.parent
+
+#: Absolute directory that holds the bundled runtime, set by the desktop app.
+#: An installed app runs a copy of ``backend/`` staged in its runtime folder
+#: (``<app environment>/project``), which has no ``bin/``; the installer keeps
+#: the runtime in ``resources/bin`` (#4051).
+BIN_DIR_ENV = "OMNIVOICE_GGUF_BIN_DIR"
 
 #: HuggingFace repo ID for the quants. Pinned by SHA via ``quant_map.json``.
 _HF_REPO_ID = "Serveurperso/OmniVoice-GGUF"
@@ -133,13 +141,25 @@ def _platform_slug() -> str:
     return "linux-x86_64"
 
 
+def _bin_dir() -> Path:
+    """Directory of the bundled runtime and its ``checksums.sha256``.
+
+    ``OMNIVOICE_GGUF_BIN_DIR`` when it is an absolute path, else ``bin/`` at
+    the repo root (source checkouts and builds that run from ``resources/``).
+    """
+    raw = os.environ.get(BIN_DIR_ENV, "").strip()
+    if raw and os.path.isabs(raw):
+        return Path(raw)
+    return _REPO_ROOT / "bin"
+
+
 def _binary_path(slug: Optional[str] = None) -> Path:
     """Resolve the on-disk path for the platform binary."""
     s = slug or _platform_slug()
     name = "omnivoice-tts-" + s
     if s.startswith("windows"):
         name += ".exe"
-    return _REPO_ROOT / "bin" / name
+    return _bin_dir() / name
 
 
 def _generate_timeout_s() -> float:
@@ -182,7 +202,10 @@ def _spawn_env() -> dict[str, str]:
         prev = env.get(var)
         env[var] = bin_dir if not prev else bin_dir + os.pathsep + prev
     from .compute import apply_compute_env
-    return apply_compute_env(env)
+    env = apply_compute_env(env)
+    if _GPU_CRASHED and env.get("GGML_BACKEND", "").strip().upper() != "CPU":
+        env["GGML_BACKEND"] = "CPU"
+    return env
 
 
 #: Shared ggml runtime libraries the build drops next to the binary. With
@@ -229,6 +252,37 @@ _ILLEGAL_INSTRUCTION_EXITS = frozenset({-4, 132, 0xC000001D, 0xC000001D - (1 << 
 #: file identity they had then. Until the file changes (rebuilt/reinstalled),
 #: the engine reports itself unavailable instead of failing every generate.
 _CPU_INCOMPATIBLE: dict[str, tuple[int, int]] = {}
+
+#: Exit codes of a native crash (access violation, stack-buffer overrun, heap
+#: corruption, SIGSEGV/SIGBUS/SIGABRT as the OS or a shell reports them). The
+#: illegal-instruction codes are handled earlier and are not GPU crashes.
+_NATIVE_CRASH_EXITS = frozenset(
+    {0xC0000005, 0xC0000409, 0xC0000374, -11, 139, -7, 135, -6, 134}
+    | {c - (1 << 32) for c in (0xC0000005, 0xC0000409, 0xC0000374)}
+)
+
+#: Set for the rest of the session once a GPU run crashed natively (#4050):
+#: the runtime loaded a GPU backend the driver cannot run (for example Vulkan
+#: on a Pascal card), so every later request is pinned to ``GGML_BACKEND=CPU``.
+_GPU_CRASHED = False
+
+
+def _native_gpu_crash(returncode, env: dict[str, str]) -> bool:
+    """Whether a nonzero exit is a native crash of a run that could use a GPU."""
+    if returncode not in _NATIVE_CRASH_EXITS:
+        return False
+    chosen = env.get("GGML_BACKEND", "").strip().upper()
+    if chosen == "CPU":
+        return False
+    if chosen:  # an explicit Vulkan<N> / CUDA<N> / Metal pin
+        return True
+    from .compute import binary_has_vulkan_module
+
+    # Unset GGML_BACKEND: ggml picks a GPU itself, Metal on Apple Silicon or
+    # Vulkan where the runtime ships that module.
+    if sys.platform == "darwin" and platform.machine().lower() in ("arm64", "aarch64"):
+        return True
+    return binary_has_vulkan_module()
 
 
 def _file_identity(path: Path) -> tuple[int, int] | None:
@@ -715,6 +769,18 @@ def _weights_missing_reason(entry: dict, revision: str, exc: BaseException | Non
     )
 
 
+class WeightsNotInstalled(RuntimeError):
+    """No usable quant pair is cached and the caller asked not to download."""
+
+    def __init__(self, message: str, entry: dict):
+        super().__init__(message)
+        self.entry = entry
+
+
+# The setting that bounds the engine self-test (read by the engines router).
+SELFTEST_TIMEOUT_ENV = "OMNIVOICE_SELFTEST_TIMEOUT_S"
+
+
 class ChecksumManifestError(RuntimeError):
     """``bin/checksums.sha256`` exists but cannot be trusted as written."""
 
@@ -735,7 +801,7 @@ def _load_checksum_manifest() -> dict[str, str]:
     :class:`ChecksumManifestError`: an entry that may have declared a checksum
     must never be skipped silently.
     """
-    manifest = _REPO_ROOT / "bin" / "checksums.sha256"
+    manifest = _bin_dir() / "checksums.sha256"
     out: dict[str, str] = {}
     if not manifest.is_file():
         return out
@@ -846,11 +912,17 @@ def _make_backend_class():
         instruct_vocabulary = "tags"
         gpu_compat = ("cuda", "vulkan", "mps", "cpu")
 
-        supports_voice_design = False
-        # The bundled omnivoice-tts CLI has no num_step/guidance_scale
-        # flags (verified against the C++ usage text) — explicit values are
-        # rejected at the API boundary with a 400 (#3654).
-        supports_num_step = False
+        # omnivoice.cpp designs a voice from --instruct / ``instructions``
+        # when no reference is given, and tokenizes the same 13 inline tags
+        # as the PyTorch engine (#4080).
+        supports_voice_design = True
+        inline_tags = OMNIVOICE_INLINE_TAGS
+        # The CLI takes ``--steps`` (MaskGIT decode steps, default 32). The
+        # resident tts-server gets ``steps`` too; the pinned commit ignores it
+        # and decodes 32 (logged once, #4081). guidance_scale
+        # has no flag in either, so it is still rejected with a 400 (#3654).
+        supports_num_step = True
+        num_step_range = (1, 64)
         supports_guidance_scale = False
         # The seed reaches the binary as --seed; the parent's torch RNG never
         # does, so /generate must forward it (#3413).
@@ -1106,7 +1178,7 @@ def _make_backend_class():
             if pair is not None:
                 return pair[0], pair[1], pair[2]
             if not download:
-                raise RuntimeError(_weights_missing_reason(entry, revision))
+                raise WeightsNotInstalled(_weights_missing_reason(entry, revision), entry)
             try:
                 from huggingface_hub import hf_hub_download
 
@@ -1237,12 +1309,51 @@ def _make_backend_class():
             serves the request when it is bundled, enabled and supports the
             controls asked for; otherwise the CLI is spawned as before.
             """
+            return self._synthesize(text, kw)[0]
+
+        def selftest_generate(self, text: str, *, timeout_s: float, **kw):
+            """Bounded diagnostic synthesis for the engine self-test (#3993).
+
+            One deadline covers the whole call and weights are never
+            downloaded here. A running resident server answers the test, so
+            no second model copy is loaded and it is never stopped for it;
+            otherwise the per-request CLI gets only the time left and is
+            killed when the budget runs out. Returns ``(audio, runtime_log)``
+            where the log is this run's own output (the CLI's, or the
+            resident process's since it started), never another request's.
+            """
+            return self._synthesize(text, kw, deadline=time.monotonic() + float(timeout_s))
+
+        def _synthesize(self, text: str, kw: dict, *, deadline: Optional[float] = None):
+            """Shared body of :meth:`generate` and :meth:`selftest_generate`.
+
+            Returns ``(audio, runtime_log)``; the log is empty when the
+            resident server answered.
+            """
             import io
 
             import soundfile as sf
             import torch
 
-            base, tokenizer, _ = self._resolve_quant_paths()
+            if kw.get("instruct"):
+                from services.instruct_safety import tag_safe_instruct
+
+                kw = {**kw, "instruct": tag_safe_instruct(kw["instruct"])}
+            diagnostic = deadline is not None
+            if diagnostic:
+                # A timed diagnostic never starts a multi-GB download it could not finish.
+                try:
+                    paths = self._resolve_quant_paths(download=False)
+                except WeightsNotInstalled as exc:
+                    raise RuntimeError(
+                        f"The GGUF weights {exc.entry.get('base')} + {exc.entry.get('tokenizer')} "
+                        "are not installed yet, and Self-test never downloads them. Run one "
+                        "normal generation with OmniVoice GGUF, or download the quant in "
+                        "Settings > Models, then test again."
+                    ) from None
+            else:
+                paths = self._resolve_quant_paths()
+            base, tokenizer, _ = paths
             ref_audio = kw.get("ref_audio")
             ref_text = kw.get("ref_text")
 
@@ -1251,6 +1362,9 @@ def _make_backend_class():
             out_path = Path(out_name)
             transcript_path: Optional[Path] = None
             converted_prompt: Optional[Path] = None
+            runtime_log = ""
+            # The resident server a self-test holds until its run ends.
+            held = None
             try:
                 if ref_audio and ref_text:
                     # A file keeps arbitrary transcript text out of argv.
@@ -1268,13 +1382,26 @@ def _make_backend_class():
                     if not _is_cli_readable_wav(prompt):
                         converted_prompt = _convert_reference_to_wav(prompt)
                         ref_audio = str(converted_prompt)
-                try:
-                    wav = self._resident_wav(
-                        text, kw, base=base, tokenizer=tokenizer, ref_audio=ref_audio,
-                        transcript=str(ref_text) if ref_audio and ref_text else None,
-                    )
-                finally:
-                    self._resident_used = time.monotonic()
+                wav = None
+                if diagnostic:
+                    held = self._hold_resident_for_selftest(deadline)
+                    if held is not None and held.alive():
+                        try:
+                            wav, runtime_log = self._resident_selftest(
+                                held, text, kw, base=base, tokenizer=tokenizer, deadline=deadline,
+                            )
+                        finally:
+                            # Used like any request: the idle sweep must not
+                            # unload the model the test just exercised.
+                            self._resident_used = time.monotonic()
+                else:
+                    try:
+                        wav = self._resident_wav(
+                            text, kw, base=base, tokenizer=tokenizer, ref_audio=ref_audio,
+                            transcript=str(ref_text) if ref_audio and ref_text else None,
+                        )
+                    finally:
+                        self._resident_used = time.monotonic()
                 if wav is not None:
                     samples, _rate = sf.read(io.BytesIO(wav), dtype="float32")
                 else:
@@ -1287,15 +1414,21 @@ def _make_backend_class():
                         language=kw.get("language"),
                         instruct=kw.get("instruct"),
                         duration=kw.get("duration"),
+                        num_step=kw.get("num_step"),
                         seed=kw.get("seed"),
                         denoise=kw.get("denoise", True),
                         preprocess_prompt=kw.get("preprocess_prompt", True),
                         chunk_duration=kw.get("chunk_duration"),
                         chunk_threshold=kw.get("chunk_threshold"),
                     )
-                    self._run_subprocess(argv, stdin_text=text)
+                    bound = {} if deadline is None else {
+                        "timeout_s": _time_left(deadline), "timeout_env": SELFTEST_TIMEOUT_ENV,
+                    }
+                    runtime_log = self._run_subprocess(argv, stdin_text=text, **bound) or ""
                     samples, _rate = sf.read(str(out_path), dtype="float32")
             finally:
+                if held is not None:
+                    held.lock.release()
                 for leftover in (out_path, transcript_path, converted_prompt):
                     if leftover is None:
                         continue
@@ -1303,7 +1436,72 @@ def _make_backend_class():
 
             if samples.ndim > 1:
                 samples = samples.mean(axis=1)
-            return torch.from_numpy(samples.astype("float32", copy=False)).unsqueeze(0)
+            audio = torch.from_numpy(samples.astype("float32", copy=False)).unsqueeze(0)
+            return audio, runtime_log
+
+        def _hold_resident_for_selftest(self, deadline: float):
+            """Hold the resident server's lock for the whole self-test.
+
+            ``None`` when resident mode cannot serve (off, or no verified
+            ``tts-server``). Otherwise the caller owns ``server.lock`` until
+            its run ends: a running server answers the test, and when none is
+            running, a generation cannot start one while the self-test's CLI
+            holds the model, so two copies never load at once.
+            """
+            from . import resident
+
+            if not resident.resident_enabled() or not resident.server_status()[0]:
+                return None
+            with self._resident_init:
+                if self._resident is None:
+                    self._resident = resident.ResidentServer()
+                server = self._resident
+            if not server.lock.acquire(timeout=_time_left(deadline)):
+                raise RuntimeError(_selftest_timeout_message("waiting for the resident server"))
+            return server
+
+        def _resident_selftest(self, server, text: str, kw: dict, *, base: Path,
+                               tokenizer: Path, deadline: float) -> tuple[bytes, str]:
+            """``(wav, log)`` from the running resident server the caller holds.
+
+            Uses the model the user already has loaded instead of loading a
+            second copy, and never starts, restarts or stops the server. A
+            server still holding another quant or launched under another
+            compute setting fails the test rather than testing (and naming
+            the device of) the wrong runtime.
+            """
+            from . import resident
+
+            if server.pair != (str(base), str(tokenizer)):
+                loaded = Path(server.pair[0]).name if server.pair else "another quant"
+                raise RuntimeError(
+                    f"The resident server still has {loaded} loaded, but {Path(base).name} is "
+                    "selected. Run one normal generation to switch it, then test again."
+                )
+            if server.compute != _spawn_env().get("GGML_BACKEND", ""):
+                raise RuntimeError(
+                    "The resident server still runs on the previous compute setting. Run one "
+                    "normal generation to apply the new one, then test again."
+                )
+            payload = resident.speech_payload(
+                text, voice=None, language=_iso_to_omnivoice_lang(kw.get("language")),
+                instruct=None, seed=None,
+            )
+            try:
+                wav = server.speak(payload, timeout=_time_left(deadline))
+            except urllib.error.HTTPError as exc:
+                raise RuntimeError(
+                    f"GGUF resident server refused the self-test (HTTP {exc.code})"
+                ) from None
+            except (OSError, ValueError, http.client.HTTPException) as exc:
+                if isinstance(exc, TimeoutError) or isinstance(
+                    getattr(exc, "reason", None), TimeoutError
+                ):
+                    raise RuntimeError(_selftest_timeout_message("on the resident server")) from None
+                raise RuntimeError(
+                    f"GGUF resident server failed the self-test: {_mask_token(str(exc))}"
+                ) from None
+            return wav, server.runtime_log()
 
         def _resident_wav(
             self,
@@ -1329,8 +1527,9 @@ def _make_backend_class():
                     with self._resident.lock:
                         self._resident.stop()
                 return None
-            ok, _why = resident.server_status()
+            ok, why = resident.server_status()
             if not ok:
+                resident.log_unavailable_once(why)
                 return None
             reason = resident.spawn_only_reason(kw, has_transcript=bool(transcript))
             if reason:
@@ -1353,6 +1552,7 @@ def _make_backend_class():
                             language=_iso_to_omnivoice_lang(kw.get("language")),
                             instruct=kw.get("instruct"),
                             seed=kw.get("seed"),
+                            steps=kw.get("num_step"),
                         )
                         return server.speak(payload, timeout=timeout_s)
                     except resident.ResidentUnavailable as exc:
@@ -1403,6 +1603,7 @@ def _make_backend_class():
             language: Optional[str],
             instruct: Optional[str] = None,
             duration: Optional[float] = None,
+            num_step: Optional[int] = None,
             seed: Optional[int] = None,
             denoise: bool = True,
             preprocess_prompt: bool = True,
@@ -1428,6 +1629,8 @@ def _make_backend_class():
                 argv += ["--instruct", instruct]
             if duration is not None:
                 argv += ["--duration", str(float(duration))]
+            if num_step is not None:
+                argv += ["--steps", str(int(num_step))]
             if seed is not None:
                 argv += ["--seed", str(int(seed))]
             if chunk_duration is not None:
@@ -1448,11 +1651,20 @@ def _make_backend_class():
                     argv += ["--ref-text", str(ref_text)]
             return argv
 
-        def _run_subprocess(self, argv: list[str], *, stdin_text: str) -> None:
+        def _run_subprocess(
+            self,
+            argv: list[str],
+            *,
+            stdin_text: str,
+            timeout_s: float | None = None,
+            timeout_env: str = "OMNIVOICE_GGUF_GENERATE_TIMEOUT_S",
+        ) -> str:
             """Spawn the binary, feed ``stdin_text``, enforce timeout.
 
             Never uses ``shell=True``. Stderr is captured and HF-token-redacted
-            before being logged at warning level.
+            before being logged at warning level. ``timeout_s`` overrides the
+            generate timeout and ``timeout_env`` names the setting that
+            raises it. Returns this run's stdout and stderr.
             """
             # #1172 class: validate the binary immediately before exec (the
             # engine may have been selected explicitly, bypassing
@@ -1464,26 +1676,53 @@ def _make_backend_class():
                 validate_executable,
             )
             validate_executable(Path(argv[0]), hint=_binary_repair_hint())
-            timeout_s = _generate_timeout_s()
-            try:
-                proc = subprocess.run(
+            if timeout_s is None:
+                timeout_s = _generate_timeout_s()
+            started = time.monotonic()
+
+            def _spawn(env, budget=None):
+                return subprocess.run(
                     argv,
                     input=stdin_text,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
                     capture_output=True,
-                    timeout=timeout_s,
+                    timeout=timeout_s if budget is None else budget,
                     check=False,
-                    env=_spawn_env(),
+                    env=env,
                     # See probe_load: keep ggml's backend scan inside bin/.
                     cwd=str(_binary_path().parent),
                 )
+
+            try:
+                env = _spawn_env()
+                proc = _spawn(env)
+                if _native_gpu_crash(proc.returncode, env):
+                    # The GPU backend crashed the process (#4050, Vulkan on a
+                    # GTX 1080). Retry this request on the CPU and keep every
+                    # later one there; any other failure is reported as-is.
+                    global _GPU_CRASHED
+                    _GPU_CRASHED = True
+                    logger.warning(
+                        "OmniVoice GGUF: the GPU backend crashed (exit %s); retrying on "
+                        "the CPU and using the CPU for the rest of this session. Set "
+                        "OMNIVOICE_GGUF_BACKEND=cpu to skip the GPU on every start. "
+                        "Runtime output: %s",
+                        proc.returncode,
+                        _mask_token((proc.stderr or "").strip()[-600:]) or "<no stderr>",
+                    )
+                    env = _spawn_env()
+                    # The retry only gets what is left of the original deadline.
+                    left = timeout_s - (time.monotonic() - started)
+                    if left <= 0:
+                        raise subprocess.TimeoutExpired(argv, timeout_s)
+                    proc = _spawn(env, left)
             except subprocess.TimeoutExpired as exc:
                 raise RuntimeError(
                     f"GGUF subprocess timed out after "
                     f"{timeout_s:.0f}s (T-04-06; raise "
-                    f"OMNIVOICE_GGUF_GENERATE_TIMEOUT_S if this host is "
+                    f"{timeout_env} if this host is "
                     f"genuinely that slow)"
                 ) from exc
             except OSError as exc:
@@ -1501,11 +1740,37 @@ def _make_backend_class():
                 )
             # On success the binary may still write progress/info to
             # stderr — log at info, redacted.
+            runtime_log = "\n".join(
+                part.strip()
+                for part in (getattr(proc, "stdout", None), proc.stderr)
+                if part and part.strip()
+            )
             if proc.stderr:
                 logger.info("[omnivoice-gguf] %s", _mask_token(proc.stderr.strip()))
+            return runtime_log
 
     _OmniVoiceGGUFBackend_cls = OmniVoiceGGUFBackend
     return _OmniVoiceGGUFBackend_cls
+
+
+def _time_left(deadline: Optional[float]) -> Optional[float]:
+    """Seconds left before ``deadline``; ``None`` keeps the default timeout.
+
+    Raises when the budget is already spent, so no process is started.
+    """
+    if deadline is None:
+        return None
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise RuntimeError(_selftest_timeout_message("before synthesis started"))
+    return left
+
+
+def _selftest_timeout_message(where: str) -> str:
+    return (
+        f"GGUF self-test ran out of time {where} (raise {SELFTEST_TIMEOUT_ENV} "
+        f"if this host is genuinely that slow)"
+    )
 
 
 def _iso_to_omnivoice_lang(code: Optional[str]) -> Optional[str]:

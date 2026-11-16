@@ -504,7 +504,7 @@ Upgrading from 0.5.3 or older (the Tauri app)? [Install the new app separately](
 | Models & quality | [Engine guides](docs/engines/README.md) · [whisper.cpp ASR](docs/engines/whisper-cpp.md) · [Benchmarks](docs/benchmarks.md) |
 | Integrations | [CLI](docs/install/script.md#terminal-command) · [Local API](docs/speech-platform.md) · [MCP](docs/mcp.md) · [Examples](examples/README.md) |
 | Phone apps | [iOS and Android](docs/mobile.md) |
-| Development | [Contributing](.github/CONTRIBUTING.md) ([sign the CLA](.github/CONTRIBUTING.md#contribution-licensing) before your first PR) · [Changelog](CHANGELOG.md) |
+| Development | [Contributing](.github/CONTRIBUTING.md) ([sign the CLA](.github/CONTRIBUTING.md#contribution-licensing) before your first PR) · [Changelog](CHANGELOG.md) · [Code signing policy](docs/code-signing-policy.md) |
 
 Agent skills: `npx skills add debpalash/VoiceStudio` (**voicestudio** for audio work, **voicestudio-maintainer** for the repo).
 
@@ -565,6 +565,6 @@ Thank you to everyone who sends code, reports, translations and ideas. [All cont
 
 <p align="center"><a href="https://discord.gg/bzQavDfVV9"><img src="docs/assets/discord-community.svg" alt="Come say hello! Join us on Discord" height="64" /></a></p>
 
-`Disclaimer`
+**Disclaimer**
 
-VoiceStudio users are strictly prohibited from for unauthorized voice cloning, voice impersonation, fraud, scams, or any other illegal or unethical activities. All users shall ensure full compliance with applicable local laws, regulations, and ethical standards. The developers assume no liability for any misuse of VoiceStudio and advocate for responsible AI development and use, encouraging the community to uphold safety and ethical principles in AI research and applications.
+VoiceStudio users are strictly prohibited from using it for unauthorized voice cloning, voice impersonation, fraud, scams, or any other illegal or unethical activities. All users shall ensure full compliance with applicable local laws, regulations, and ethical standards. The developers assume no liability for any misuse of VoiceStudio and advocate for responsible AI development and use, encouraging the community to uphold safety and ethical principles in AI research and applications.

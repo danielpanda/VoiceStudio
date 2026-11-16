@@ -52,7 +52,7 @@ from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from api.dependencies import is_local_host, ws_remote_authorized
+from api.dependencies import require_ws_access
 from services.dictation_cleanup import join_dictation_pieces, polish_dictation
 from services.text_polish import polish_text
 
@@ -307,28 +307,13 @@ async def ws_transcribe(websocket: WebSocket):
     is_platform_stream = websocket.url.path == PLATFORM_STREAM_PATH
     if is_platform_stream:
         websocket = _PlatformWebSocket(websocket)
-    # A browser can reach localhost regardless of the page's own origin.
-    # Reject ambient cross-site WebSocket handshakes before the loopback-host
-    # shortcut or accept(), while keeping native clients (no Origin header)
-    # and configured/same-origin browser UIs working (#1646 review).
-    origin = websocket.headers.get("origin")
-    if origin:
-        from core.csrf import origin_allowed
-
-        if not origin_allowed(websocket):
-            await websocket.close(code=1008, reason="browser origin not allowed")
-            return
-    # Loopback origin guard — refuse anything not from 127.0.0.1, ::1, or
-    # localhost. Privileged HTTP routers use Depends(require_admin) at router
-    # level; WebSocket dependency injection differs across FastAPI versions, so we
-    # inline the check before accept(). Without it, any local process could
-    # stream the user's microphone over this endpoint.
-    # Wave 2.3 (remote backend): a non-loopback client that presents the
-    # OMNIVOICE_API_KEY bearer is the thin-client dictation case — the mic
-    # lives on the user's machine, the GPU here — and is allowed through.
-    host = websocket.client.host if websocket.client else None
-    if not is_local_host(host) and not ws_remote_authorized(websocket):
-        await websocket.close(code=1008, reason="loopback origin required")
+    # Shared WS admission gate (cross-site Origin rejection, then the
+    # loopback/trusted-network/remote-credential check) before accept().
+    # Privileged HTTP routers use Depends(require_admin) at router level, but
+    # WebSocket dependency injection differs across FastAPI versions, so the
+    # guard is a plain function awaited here. Without it, any local process
+    # could stream the user's microphone over this endpoint.
+    if not await require_ws_access(websocket):
         return
 
     await websocket.accept()
@@ -557,10 +542,12 @@ async def ws_transcribe(websocket: WebSocket):
 
     # Final transcription on complete buffer — skip if client already gone.
     if total_bytes > MIN_FINAL_BUFFER_BYTES:
+        from core import diagnostic_reports
+        diagnostic_epoch = diagnostic_reports.observe_grant()
         try:
-            result = await _transcribe_buffer_full(
+            result = await diagnostic_reports.await_owned(_transcribe_buffer_full(
                 audio_chunks, pcm_sr=pcm_sr, dictation=not is_platform_stream,
-            )
+            ), diagnostic_epoch)
             # Dictation v2: deterministic polish so the pasted final reads
             # like typed text (leading capital, terminal punctuation).
             if is_platform_stream:
@@ -592,6 +579,8 @@ async def ws_transcribe(websocket: WebSocket):
                 # Accepted at session start, revoked since: keep it typed.
                 await _safe_send({"type": "error", "kind": e.detail()["code"], **e.detail()})
             else:
+                if diagnostic_epoch is not None:
+                    diagnostic_reports.capture_failure("transcription", error=e, expected_epoch=diagnostic_epoch)
                 logger.exception("Final transcription failed")
                 await _safe_send({"type": "error", "message": str(e),
                                   "kind": "transcribe", "detail": str(e)})
@@ -850,9 +839,13 @@ async def _sherpa_load_with_status(websocket: WebSocket, backend, spec) -> bool:
     except Exception:
         logger.warning("Sherpa load status could not be delivered; stopping stream setup")
         return False
+    from core import diagnostic_reports
+    diagnostic_epoch = diagnostic_reports.observe_grant()
     try:
-        await asyncio.to_thread(backend.ensure_loaded)
+        await diagnostic_reports.await_owned(asyncio.to_thread(backend.ensure_loaded), diagnostic_epoch)
     except Exception as e:
+        if diagnostic_epoch is not None:
+            diagnostic_reports.capture_failure("model_load", error=e, engine_id="sherpa-onnx-asr", expected_epoch=diagnostic_epoch)
         logger.exception("sherpa dictation load failed (%s)", spec.id)
         try:
             await websocket.send_json({"type": "error", "message": str(e),
@@ -1264,10 +1257,12 @@ async def _transcribe_buffer(
             result = backend.transcribe(tmp, word_timestamps=False, **hint)
             return _result_text(result)
 
-        # Bound dictation transcribes (#730): a wedged whisperx/CTranslate2 call
-        # must not hold its GPU-pool worker forever and starve TTS / other ASR
-        # into a "can't reach backend"; on timeout the pool is reset to recover.
-        text = await run_transcribe_guarded(_gpu_pool, _run, what="Dictation")
+        # Bound dictation requests (#730). Timed-out native work retains its
+        # worker accounting until it exits, preventing overlapping retries (#1669).
+        text = await run_transcribe_guarded(
+            _gpu_pool, _run, what="Dictation",
+            **({"duration_s": sum(map(len, chunks)) / (pcm_sr * 2)} if pcm_sr else {"audio_path": tmp}),
+        )
         return text.strip()
     finally:
         try:
@@ -1288,7 +1283,8 @@ async def _transcribe_buffer_full(
     tmp = _pcm16_to_wav(b"".join(chunks), pcm_sr) if pcm_sr else _chunks_to_wav(chunks)
     if tmp is None:
         return {"text": "", "segments": [], "language": "unknown",
-                "duration_s": 0, "transcription_time_s": 0, "engine": "none"}
+                "duration_s": 0, "transcription_time_s": 0, "engine": "none",
+                "timestamps_available": False}
 
     try:
         from services.model_manager import _gpu_pool
@@ -1321,23 +1317,28 @@ async def _transcribe_buffer_full(
             ends = [e for e in (s.get("end") for s in segments) if isinstance(e, (int, float))]
             duration = max(ends) if ends else 0.0
 
+            out_segments = [
+                {"start": _timing(s.get("start", 0)),
+                 "end": _timing(s.get("end", 0)),
+                 "text": s.get("text", "").strip()}
+                for s in segments
+            ]
+            from services.asr_backend import has_recognition_timestamps
             return {
                 "text": full_text,
-                "segments": [
-                    {"start": _timing(s.get("start", 0)),
-                     "end": _timing(s.get("end", 0)),
-                     "text": s.get("text", "").strip()}
-                    for s in segments
-                ],
+                "segments": out_segments,
+                "timestamps_available": has_recognition_timestamps(result, segments=out_segments),
                 "language": result.get("language", "unknown"),
                 "duration_s": round(duration, 2),
                 "transcription_time_s": elapsed,
                 "engine": backend.id,
             }
 
-        # Bounded + pool-resetting on timeout (#730), same rationale as the
-        # partial path above.
-        return await run_transcribe_guarded(_gpu_pool, _run, what="Dictation")
+        # Same bounded request and native-worker accounting as the partial path.
+        return await run_transcribe_guarded(
+            _gpu_pool, _run, what="Dictation",
+            **({"duration_s": sum(map(len, chunks)) / (pcm_sr * 2)} if pcm_sr else {"audio_path": tmp}),
+        )
     finally:
         try:
             os.unlink(tmp)

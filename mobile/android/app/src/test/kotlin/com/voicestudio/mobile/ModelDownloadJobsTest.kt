@@ -2,12 +2,15 @@ package com.voicestudio.mobile
 
 import android.app.Application
 import android.app.job.JobScheduler
+import android.app.job.JobInfo
+import android.net.NetworkRequest
 import android.net.NetworkCapabilities
 import androidx.test.core.app.ApplicationProvider
 import androidx.work.testing.WorkManagerTestInitHelper
 import com.voicestudio.mobile.data.ModelDownloadJobs
 import com.voicestudio.mobile.local.ModelCatalog
 import com.voicestudio.mobile.local.PhoneModel
+import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
 import org.junit.*
 import org.junit.Assert.*
@@ -29,6 +32,85 @@ class ModelDownloadJobsTest {
         model=app.assets.open("models.json").bufferedReader().use {ModelCatalog.decode(it.readText()).models.first {!it.gated}}
     }
     @After fun clean() {ModelDownloadJobs.cancel(app,model.id);scheduler.cancelAll()}
+    private fun vpnCapabilities(unmetered: Boolean=false): NetworkCapabilities {
+        val defaults=NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build()
+        val vpn=NetworkCapabilities()
+        org.robolectric.Shadows.shadowOf(vpn).apply {
+            // Include SDK-owned defaults (e.g. VCN policy) without hidden constants.
+            defaults.capabilities.forEach {addCapability(it)}
+            addTransportType(NetworkCapabilities.TRANSPORT_VPN)
+            removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            if(unmetered)addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+        }
+        return vpn
+    }
+    @Test fun mobileAllowedDownloadCanMatchTheDefaultVpnNetwork() {
+        ModelDownloadJobs.enqueue(app,model,true)
+        val vpn=vpnCapabilities()
+        val defaults=NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build()
+        assertTrue(defaults.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN))
+        assertFalse(defaults.canBeSatisfiedBy(vpn))
+        val allowed=NetworkRequest.Builder(defaults).removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN).build()
+        assertTrue("SDK control: request=$allowed, VPN=$vpn",allowed.canBeSatisfiedBy(vpn))
+        val queued=scheduler.allPendingJobs.single().requiredNetwork!!
+        assertTrue("The queued download must not require bypassing the user's VPN: request=$queued, VPN=$vpn",queued.canBeSatisfiedBy(vpn))
+    }
+    @Test fun wifiOnlyDownloadCanMatchAnUnmeteredVpnAndStillRejectsMeteredNetworks() {
+        ModelDownloadJobs.enqueue(app,model,false)
+        val vpn=vpnCapabilities(unmetered=true)
+        val request=scheduler.allPendingJobs.single().requiredNetwork!!
+        assertTrue("Wi-Fi policy must allow an unmetered tunnel: request=$request, VPN=$vpn",request.canBeSatisfiedBy(vpn))
+        val metered=NetworkCapabilities(vpn)
+        org.robolectric.Shadows.shadowOf(metered).removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+        assertFalse(request.canBeSatisfiedBy(metered))
+    }
+    @Test fun restoreMigratesLegacyVpnExclusionWithoutDiscardingPartialsOrPause() {
+        ModelDownloadJobs.enqueue(app,model,false)
+        val current=scheduler.allPendingJobs.single()
+        val legacy=NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build()
+        scheduler.schedule(JobInfo.Builder(current.id,current.service).setUserInitiated(true)
+            .setRequiredNetwork(legacy).setExtras(current.extras).build())
+        val partial=java.io.File(app.noBackupFilesDir,"models/${model.id}/${model.files.first().path}.part")
+        partial.parentFile!!.mkdirs();partial.writeText("saved range prefix")
+        ModelDownloadJobs.restore(app,listOf(model))
+        val restored=scheduler.allPendingJobs.single()
+        assertEquals(current.id,restored.id)
+        assertFalse(restored.requiredNetwork!!.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN))
+        assertTrue(restored.requiredNetwork!!.hasTransport(NetworkCapabilities.TRANSPORT_VPN))
+        assertEquals("saved range prefix",partial.readText())
+        ModelDownloadJobs.pause(app,model.id);ModelDownloadJobs.restore(app,listOf(model))
+        assertTrue(scheduler.allPendingJobs.isEmpty());assertEquals("saved range prefix",partial.readText())
+    }
+    @Test @Config(sdk=[33]) fun changingMobilePolicyReplacesTheLegacyWorkerConstraints() {
+        ModelDownloadJobs.enqueue(app,model,false)
+        val manager=androidx.work.WorkManager.getInstance(app)
+        fun unfinished()=manager.getWorkInfosForUniqueWork("model:${model.id}").get(5,java.util.concurrent.TimeUnit.SECONDS)
+            .filter {!it.state.isFinished}.single()
+        val before=unfinished()
+        assertEquals(androidx.work.NetworkType.UNMETERED,before.constraints.requiredNetworkType)
+        ModelDownloadJobs.enqueue(app,model,true)
+        val after=unfinished()
+        assertEquals(androidx.work.NetworkType.CONNECTED,after.constraints.requiredNetworkType)
+        assertNotEquals(before.id,after.id)
+        ModelDownloadJobs.pause(app,model.id);ModelDownloadJobs.restore(app,listOf(model))
+        assertTrue(manager.getWorkInfosForUniqueWork("model:${model.id}").get(5,java.util.concurrent.TimeUnit.SECONDS).all {it.state.isFinished})
+    }
+    @Test @Config(sdk=[33]) fun restoreMigratesAPersistedWorkerPolicyWithoutDeletingPartialBytes() {
+        ModelDownloadJobs.enqueue(app,model,false)
+        val preferences=app.getSharedPreferences("model-downloads",0)
+        val saved=preferences.getString("queue","")!!
+        assertTrue(saved.contains("\"mobile\":false"))
+        preferences.edit().putString("queue",saved.replace("\"mobile\":false","\"mobile\":true")).commit()
+        val partial=java.io.File(app.noBackupFilesDir,"models/${model.id}/${model.files.first().path}.part")
+        partial.parentFile!!.mkdirs();partial.writeText("durable prefix")
+        ModelDownloadJobs.restore(app,listOf(model))
+        val jobs=androidx.work.WorkManager.getInstance(app).getWorkInfosForUniqueWork("model:${model.id}")
+            .get(5,java.util.concurrent.TimeUnit.SECONDS).filter {!it.state.isFinished}
+        assertEquals(androidx.work.NetworkType.CONNECTED,jobs.single().constraints.requiredNetworkType)
+        assertEquals("durable prefix",partial.readText())
+    }
     @Test fun explicitDownloadSchedulesPersistentUserInitiatedWifiWork() {
         ModelDownloadJobs.enqueue(app,model,false)
         val job=scheduler.allPendingJobs.single()
@@ -188,6 +270,62 @@ class ModelDownloadJobsTest {
         } finally {release.countDown()}
         work.join()
         assertTrue("Pause must cancel a worker still loading the catalogue",work.isCancelled)
+    }
+
+    private suspend fun catalogueFailureReport(startEnabled:Boolean,changeGrant:Boolean,expected:Int,cancel:Boolean=false)=kotlinx.coroutines.coroutineScope {
+        val directory=java.nio.file.Files.createTempDirectory("download-grant").toFile()
+        val bodies=java.util.concurrent.CopyOnWriteArrayList<String>()
+        val transport=object:com.voicestudio.mobile.network.DiagnosticTransport {
+            override suspend fun send(destination:com.voicestudio.mobile.network.DiagnosticDestination,body:ByteArray,allowed:()->Boolean):Int {
+                check(allowed());bodies.add(body.toString(Charsets.UTF_8));return 201
+            }
+            override fun cancelAll()=Unit
+        }
+        val policy=app.assets.open("diagnostics.json").bufferedReader(Charsets.UTF_8).use {com.voicestudio.mobile.network.DiagnosticPolicy(it.readText())}
+        val reporter=com.voicestudio.mobile.network.DiagnosticReports(directory,policy,
+            com.voicestudio.mobile.network.DiagnosticDestination("fixture","https://collector.invalid","https://app.invalid"),"1.0.0",transport=transport)
+        val field=com.voicestudio.mobile.data.AutomaticDiagnostics::class.java.getDeclaredField("reporter").apply {isAccessible=true}
+        val previous=field.get(com.voicestudio.mobile.data.AutomaticDiagnostics)
+        val entered=java.util.concurrent.CountDownLatch(1);val release=java.util.concurrent.CountDownLatch(1)
+        reporter.load();field.set(com.voicestudio.mobile.data.AutomaticDiagnostics,reporter)
+        try {
+            if(startEnabled)reporter.setConsent(true)
+            ModelDownloadJobs.enqueue(app,model,false)
+            val context=object:android.content.ContextWrapper(app) {
+                override fun getApplicationContext():android.content.Context=this
+                override fun getAssets():android.content.res.AssetManager {
+                    if(Thread.currentThread().stackTrace.any {it.className.contains("ModelDownloadJobs\$run")}) {
+                        entered.countDown();check(release.await(10,java.util.concurrent.TimeUnit.SECONDS))
+                        if(cancel)throw kotlinx.coroutines.CancellationException("controlled cancellation")
+                        throw java.io.IOException("private catalogue detail")
+                    }
+                    return app.assets
+                }
+            }
+            val worker=androidx.work.testing.TestListenableWorkerBuilder<com.voicestudio.mobile.data.ModelDownloadWorker>(context)
+                .setInputData(androidx.work.workDataOf("model" to model.id))
+                .setForegroundUpdater {_,_,_->androidx.concurrent.futures.CallbackToFutureAdapter.getFuture<Void> {it.set(null);"promoted"}}.build()
+            val work=async(kotlinx.coroutines.Dispatchers.Default) {runCatching {worker.doWork()}}
+            try {
+                assertTrue("Download did not reach the controlled catalogue boundary",entered.await(10,java.util.concurrent.TimeUnit.SECONDS))
+                if(changeGrant) {if(startEnabled)reporter.setConsent(false);reporter.setConsent(true)}
+            }finally{release.countDown()}
+            val result=work.await()
+            if(cancel)assertTrue(result.exceptionOrNull() is kotlinx.coroutines.CancellationException)
+            else assertTrue(result.getOrThrow() is androidx.work.ListenableWorker.Result.Failure)
+            reporter.flush()
+            assertEquals("A terminal download must retain its starting consent",expected,bodies.size)
+            assertTrue(bodies.none {it.contains("private catalogue detail")})
+        }finally{
+            release.countDown();field.set(com.voicestudio.mobile.data.AutomaticDiagnostics,previous)
+            reporter.close();directory.deleteRecursively()
+        }
+    }
+    @Test @Config(sdk=[33]) fun downloadStartedOffCannotBorrowLaterOptIn()=kotlinx.coroutines.runBlocking {catalogueFailureReport(false,true,0)}
+    @Test @Config(sdk=[33]) fun downloadStartedUnderPriorGrantCannotBorrowReplacement()=kotlinx.coroutines.runBlocking {catalogueFailureReport(true,true,0)}
+    @Test @Config(sdk=[33]) fun freshDownloadFailureReportsUnderItsStartingGrant()=kotlinx.coroutines.runBlocking {catalogueFailureReport(true,false,1)}
+    @Test @Config(sdk=[33]) fun downloadFailureWhileOffAndCancellationStayUnreported()=kotlinx.coroutines.runBlocking {
+        catalogueFailureReport(false,false,0);catalogueFailureReport(true,false,0,cancel=true)
     }
 
 }

@@ -41,8 +41,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: mobile-${{ github.ref }}
-  cancel-in-progress: true
+  # Each main push/manual verification must finish, including pending runs.
+  # PR refs stay stable so newer commits cancel only that PR's older run.
+  group: mobile-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  # A newer push to main must not cancel a mobile verification that is still
+  # running: these builds are the release gate for both native apps, and a
+  # cancelled run leaves the app unverified with no failure to act on. Pull
+  # requests still cancel their own superseded runs.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   changes:
@@ -145,9 +151,10 @@ jobs:
     if: ${{ !cancelled() && needs.changes.outputs.runtime != 'false' }}
     # Same SDK as the TestFlight upload, so App Store toolchain breaks show up here first.
     runs-on: macos-26
-    # Cold simulator/device compilation can exhaust an hour after tests pass.
+    # Cold simulator/device compilation can exhaust an hour after tests pass, and a
+    # native-runtime cache miss adds about 21 minutes (main, 2026-11-12: 92 minutes).
     # Keep the full validation run bounded without relaxing UI-test deadlines.
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -166,15 +173,21 @@ jobs:
         if: steps.pass.outputs.hit != 'true'
         run: python3 mobile/ios/scripts/test_resources.py
 
+      - name: Build VoiceStudioKit tests
+        if: steps.pass.outputs.hit != 'true'
+        working-directory: mobile/ios/VoiceStudioKit
+        timeout-minutes: 20
+        run: swift build --build-tests
+
       - name: VoiceStudioKit tests
         if: steps.pass.outputs.hit != 'true'
         working-directory: mobile/ios/VoiceStudioKit
-        # Serial on purpose. In parallel the suite hangs on the 3-core runner (the step
-        # sat for the whole 60 minute job timeout on three runs); run one at a time all
-        # 201 tests pass in about 155 s, the same time the parallel run used to take.
-        # A 15 minute cap turns any new hang into a fast, named failure.
-        timeout-minutes: 15
-        run: swift test --no-parallel
+        # Serial on purpose: in parallel the suite hangs on the 3-core runner. The
+        # watchdog runs it on a terminal so each test's start line reaches the log at
+        # once; a test that prints nothing for 120 s is named, its process stacks are
+        # printed, and the run is killed. The step cap is the backstop.
+        timeout-minutes: 10
+        run: python3 ../scripts/test_watchdog.py --stall 120 -- swift test --no-parallel --skip-build
 
       # iOS xcframeworks for the pinned on-device runtimes (sherpa-onnx, onnxruntime,
       # llama.cpp, omnivoice.cpp); needs Xcode, so it only runs here.
@@ -229,12 +242,15 @@ jobs:
 
       - name: UI smoke test
         if: steps.pass.outputs.hit != 'true'
+        # The suite takes about 30 minutes. No retry flags: on this runner a retry
+        # re-ran all 34 tests, so one failure doubled the step and pushed the job to
+        # its job time limit. Each test gets a 10 minute allowance instead (the
+        # slowest takes under 5), so a hang fails that test by name and the run
+        # moves on; the step cap bounds anything the allowance cannot.
+        timeout-minutes: 50
         run: |
-          # Second line of defence behind the explicit waits in the UI tests: a test
-          # that fails is re-run once in a fresh process, and the job fails unless it
-          # then passes, so a repeatable failure still fails the build.
           xcodebuild -project mobile/ios/VoiceStudio/VoiceStudio.xcodeproj \
-            -retry-tests-on-failure -test-iterations 2 -test-repetition-relaunch-enabled YES \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 600 \
             -scheme VoiceStudio -destination "id=$SIM_UDID" \
             -resultBundlePath "$RUNNER_TEMP/ui.xcresult" \
             CODE_SIGNING_ALLOWED=NO test-without-building

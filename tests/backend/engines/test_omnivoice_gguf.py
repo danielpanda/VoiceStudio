@@ -178,6 +178,54 @@ def test_is_available_passes_when_manifest_absent(monkeypatch, tmp_path, cached_
     assert ok is True, reason
 
 
+def test_installed_app_finds_the_runtime_outside_the_staged_backend(
+    monkeypatch, tmp_path, cached_weights
+):
+    """#4051 — an installed app runs a copy of backend/ staged in its runtime
+    folder (``<app environment>/project``), which has no bin/. The runtime and
+    its manifest stay in the installer's resources/bin, which the desktop app
+    passes as OMNIVOICE_GGUF_BIN_DIR."""
+    import hashlib
+
+    from engines.omnivoice_gguf import backend as gguf_backend
+
+    project = tmp_path / "project"
+    project.mkdir()
+    resources_bin = tmp_path / "resources" / "bin"
+    resources_bin.mkdir(parents=True)
+    exe = resources_bin / "omnivoice-tts-linux-x86_64"
+    exe.write_bytes(b"\x7fELF-real-enough")
+    exe.chmod(0o755)
+    digest = hashlib.sha256(exe.read_bytes()).hexdigest()
+    (resources_bin / "checksums.sha256").write_text(
+        f"{digest}  {exe.name}\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(gguf_backend, "_REPO_ROOT", project)
+    monkeypatch.setattr(gguf_backend, "_platform_slug", lambda: "linux-x86_64")
+    monkeypatch.setattr(gguf_backend, "_is_macos_quarantined", lambda p: False)
+    monkeypatch.setenv("OMNIVOICE_GGUF_BIN_DIR", str(resources_bin))
+
+    ok, reason = gguf_backend._make_backend_class().is_available()
+    assert ok is True, reason
+    assert gguf_backend._binary_path() == exe
+    assert gguf_backend._load_checksum_manifest() == {exe.name: digest}
+
+
+def test_runtime_dir_defaults_to_the_repo_bin(monkeypatch):
+    """Source checkouts (no OMNIVOICE_GGUF_BIN_DIR) keep using <repo>/bin, and a
+    relative value is ignored rather than resolved against the working directory."""
+    from engines.omnivoice_gguf import backend as gguf_backend
+
+    monkeypatch.delenv("OMNIVOICE_GGUF_BIN_DIR", raising=False)
+    assert gguf_backend._binary_path("linux-x86_64") == (
+        gguf_backend._REPO_ROOT / "bin" / "omnivoice-tts-linux-x86_64"
+    )
+    monkeypatch.setenv("OMNIVOICE_GGUF_BIN_DIR", "bin")
+    assert gguf_backend._binary_path("linux-x86_64") == (
+        gguf_backend._REPO_ROOT / "bin" / "omnivoice-tts-linux-x86_64"
+    )
+
+
 def test_probe_load_timeout(monkeypatch, tmp_path):
     """T-04-06 — a hung binary surfaces as subprocess.TimeoutExpired."""
     from engines.omnivoice_gguf import backend as gguf_backend
@@ -329,21 +377,39 @@ class _GgufRig:
 def test_generate_translates_controls_into_flags(monkeypatch, tmp_path):
     rig = _GgufRig(monkeypatch, tmp_path)
     rig.instance.generate(
-        "x", instruct="whispering", duration=1.75, seed=99,
+        "x", instruct="whisper", duration=1.75, num_step=16, seed=99,
         denoise=False, preprocess_prompt=False, chunk_duration=0, chunk_threshold=500,
     )
-    assert rig.flag_value("--instruct") == "whispering"
+    assert rig.flag_value("--instruct") == "whisper"
     assert rig.flag_value("--duration") == "1.75"
+    assert rig.flag_value("--steps") == "16"
     assert rig.flag_value("--seed") == "99"
     assert rig.flag_value("--chunk-duration") == "0.0"
     assert rig.flag_value("--chunk-threshold") == "500.0"
     assert {"--no-denoise", "--no-preprocess-prompt"} <= set(rig.argvs[-1])
 
 
+def test_voice_design_and_inline_tags_are_advertised():
+    """#4080: omnivoice.cpp designs from --instruct and tokenizes the same tags."""
+    from engines.omnivoice_gguf import backend as gguf_backend
+    from services.expression import OMNIVOICE_INLINE_TAGS
+
+    cls = gguf_backend._make_backend_class()
+    assert cls.supports_voice_design is True
+    assert cls.inline_tags == OMNIVOICE_INLINE_TAGS
+
+
+def test_design_without_a_reference_forwards_the_instruction(monkeypatch, tmp_path):
+    rig = _GgufRig(monkeypatch, tmp_path)
+    rig.instance.generate("x [laughter]", instruct="female, low pitch")
+    assert rig.flag_value("--instruct") == "female, low pitch"
+    assert "--ref-wav" not in rig.argvs[-1]
+
+
 def test_generate_without_controls_emits_no_extra_flags(monkeypatch, tmp_path):
     rig = _GgufRig(monkeypatch, tmp_path)
     rig.instance.generate("x")
-    optional = {"--instruct", "--duration", "--seed", "--no-denoise", "--no-preprocess-prompt",
+    optional = {"--instruct", "--duration", "--steps", "--seed", "--no-denoise", "--no-preprocess-prompt",
                 "--chunk-duration", "--chunk-threshold", "--ref-text", "--ref-wav"}
     assert optional.isdisjoint(rig.argvs[-1])
 
@@ -1165,7 +1231,7 @@ def test_generate_leaves_quality_knobs_to_the_caller(monkeypatch):
     from engines.omnivoice_gguf import backend as gguf_backend
 
     cls = gguf_backend._make_backend_class()
-    assert cls.supports_num_step is False
+    assert cls.supports_num_step is True
     assert cls.supports_guidance_scale is False
     backend = cls()
     monkeypatch.setattr(
@@ -1177,3 +1243,16 @@ def test_generate_leaves_quality_knobs_to_the_caller(monkeypatch):
                {"guidance_scale": 5.0}):
         with pytest.raises(FileNotFoundError, match="test-no-binary"):
             backend.generate("hello world", **kw)
+
+
+@pytest.mark.parametrize("tier", [None, "fast", "max"])
+def test_every_route_defaults_gguf_to_its_native_step_count(monkeypatch, tier):
+    """Batch, dubbing, /convert and /generate fill num_step from tts_defaults;
+    GGUF is untiered, so they must get 32 rather than the generic 16 (#4084)."""
+    from engines.omnivoice_gguf.resident import DEFAULT_DECODE_STEPS
+    from services import performance_profiles
+
+    monkeypatch.setattr(performance_profiles, "requested_tier", lambda _family: tier)
+    assert performance_profiles.ENGINE_DEFAULT_NUM_STEP["omnivoice-gguf"] == DEFAULT_DECODE_STEPS
+    assert performance_profiles.tts_defaults("omnivoice-gguf") == {"num_step": DEFAULT_DECODE_STEPS}
+    assert "num_step" not in performance_profiles.tts_defaults("kokoro")

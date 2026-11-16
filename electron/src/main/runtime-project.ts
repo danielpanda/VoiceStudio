@@ -3,6 +3,7 @@ import {
   cudaOnlyPackages,
   windowsRocmSyncArgs,
 } from '../../scripts/torch-variant.mjs';
+import { setTimeout as delay } from 'node:timers/promises';
 export { nvidiaDriverPresent, cudaOnlyPackages } from '../../scripts/torch-variant.mjs';
 import { inspectRuntimeInterpreter } from './runtime-interpreter';
 import { RuntimeLaunchRefusedError, runtimeLaunchRefusal } from './runtime-launch-refusal';
@@ -30,7 +31,11 @@ import {
 } from './rename-retry';
 import { downloadRuntimeInstaller } from './runtime-download';
 import { asciiSafePthFiles } from './pth-ascii';
-import { pruneInterruptedUvDownloads, setupDownloadHosts } from './setup-downloads';
+import {
+  failedDownloadSource,
+  pruneInterruptedUvDownloads,
+  setupDownloadHosts,
+} from './setup-downloads';
 import {
   AUTO_PYPI_MIRROR,
   PYPI_FILES_ORIGIN,
@@ -244,7 +249,7 @@ async function effectiveRegion(region: RuntimeRegion, signal: AbortSignal): Prom
   if (region !== 'auto') return region;
   const [direct, mirror] = await Promise.all([
     probeLatency('https://github.com', signal),
-    probeLatency('https://ghproxy.net/https://github.com', signal),
+    probeLatency(`${new URL(PYTHON_DOWNLOAD_MIRROR).origin}/https://github.com`, signal),
   ]);
   if (direct !== null && (mirror === null || mirror * 5 > direct * 4)) return 'global';
   return 'restricted';
@@ -991,6 +996,9 @@ export async function stageRuntimeSources(
  * one against the pinned hash. Every outcome restores the bundled lock, and a
  * failed mirrored sync is retried once from the original URLs: finished wheels
  * stay in uv's cache, so the retry only fetches what the mirror could not.
+ * Auto may also try the sanctioned mirror after an actual PyPI-origin network
+ * failure. Explicit regions, non-PyPI hosts and integrity/authentication failures
+ * do not enter that path; every outcome restores the bundled lock.
  */
 export interface MirrorReporter {
   /** A setup log line. */
@@ -999,6 +1007,8 @@ export interface MirrorReporter {
   pypiHost?: (host: string) => void;
   /** Byte progress of a wheel the shell downloads itself (#3411). */
   transfer?: (name: string, received: number, total: number) => void;
+  /** Auto may try the sanctioned mirror after a proven transient PyPI-origin failure. */
+  allowOriginMirrorFallback?: boolean;
 }
 
 export async function syncLockedWithMirror(
@@ -1006,19 +1016,19 @@ export async function syncLockedWithMirror(
   mirror: string | null,
   sync: () => Promise<unknown>,
   signal: AbortSignal,
-  { log = () => {}, pypiHost = () => {} }: MirrorReporter = {},
+  { log = () => {}, pypiHost = () => {}, allowOriginMirrorFallback = false }: MirrorReporter = {},
   /** Locked artifact URL to the `file://` copy already downloaded and verified (#3411). */
   localUrls: ReadonlyMap<string, string> = new Map(),
 ): Promise<void> {
   const lockPath = join(project, 'uv.lock');
-  if (!mirror && !localUrls.size) {
+  if (!mirror && !localUrls.size && !allowOriginMirrorFallback) {
     await sync();
     return;
   }
   const original = await readFile(lockPath, 'utf8');
   const local = localizeLockUrls(original, localUrls);
   const mirrored = mirror ? mirrorLockUrls(local, mirror) : local;
-  if (mirrored === original) {
+  if (mirrored === original && !allowOriginMirrorFallback) {
     await sync();
     return;
   }
@@ -1046,11 +1056,43 @@ export async function syncLockedWithMirror(
     } catch (error) {
       // uv could not use a prefetched copy (removed or locked by an antivirus
       // after it was verified): let uv download everything itself (#3411).
-      if (signal.aborted || !localUrls.size) throw error;
+      let failure = error;
+      if (signal.aborted) throw failure;
+      if (localUrls.size) {
+        log(
+          `Install from the pre-downloaded wheels failed (${errorSummary(error)}); letting uv download them.`,
+        );
+        await writeFile(lockPath, original);
+        try {
+          await sync();
+          return;
+        } catch (retryError) {
+          failure = retryError;
+        }
+      }
+      const detail = `${(failure as { stderr?: unknown } | null)?.stderr ?? ''}\n${failure instanceof Error ? failure.message : String(failure)}`;
+      if (
+        signal.aborted ||
+        mirror ||
+        !allowOriginMirrorFallback ||
+        !isTransientDownloadFailure(failure) ||
+        /\b(?:HTTP|status(?: code)?)\b[^\n]{0,40}\b(?:401|403)\b|hash mismatch|hashes (?:do|did) not match/i.test(
+          detail,
+        ) ||
+        /invalid peer certificate|certificate[_ ]verify[_ ]failed|unknown ?issuer|unable to get local issuer|certificate (?:has expired|is not yet valid)|hostname mismatch/i.test(
+          detail,
+        ) ||
+        !failedDownloadSource(detail)?.pypiArchive
+      )
+        throw failure;
+      const fallback = mirrorLockUrls(original, AUTO_PYPI_MIRROR);
+      if (fallback === original) throw failure;
       log(
-        `Install from the pre-downloaded wheels failed (${errorSummary(error)}); letting uv download them.`,
+        `PyPI download failed at ${origin}; retrying the same hash-pinned files from ${new URL(AUTO_PYPI_MIRROR).host}. Finished downloads are kept.`,
       );
-      await writeFile(lockPath, original);
+      pypiHost(new URL(AUTO_PYPI_MIRROR).host);
+      await writeFile(lockPath, fallback);
+      signal.throwIfAborted();
       await sync();
     }
   } finally {
@@ -1174,9 +1216,10 @@ export async function retryTransientDownload(
   signal: AbortSignal,
   log: (line: string) => void = () => {},
   delays: readonly number[] = TRANSIENT_SYNC_DELAYS_MS,
-  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+  sleep: (ms: number) => Promise<void> = (ms) => delay(ms, undefined, { signal }),
 ): Promise<void> {
   for (let attempt = 0; ; attempt++) {
+    signal.throwIfAborted();
     try {
       await sync();
       return;
@@ -1200,8 +1243,56 @@ export async function retryTransientDownload(
         `Download failed on a temporary server error; retrying in ${Math.round(delays[attempt]! / 1000)}s ` +
           `(attempt ${attempt + 2} of ${delays.length + 1}). Finished downloads are kept.`,
       );
-      await sleep(delays[attempt]!);
-      signal.throwIfAborted();
+      try {
+        await sleep(delays[attempt]!);
+      } finally {
+        // timers/promises rejects with its own AbortError; preserve the
+        // caller's reason and never advance to another download after Cancel.
+        signal.throwIfAborted();
+      }
+    }
+  }
+}
+
+/**
+ * `uv python install`, switching once between GitHub and its mirror when the
+ * first source fails. A Python download that stalls on GitHub (release
+ * assets throttled while github.com itself answers the region probe) would
+ * otherwise stall again in the sync. Only for the Auto region with no
+ * user-set `UV_PYTHON_INSTALL_MIRROR`; a chosen region or mirror is kept. The
+ * source that worked stays in `env` for the rest of setup.
+ */
+export async function installManagedPython(
+  uv: string,
+  args: string[],
+  project: string,
+  env: NodeJS.ProcessEnv,
+  run: RuntimeRunner,
+  signal: AbortSignal,
+  allowFallback: boolean,
+  log: (line: string) => void = () => {},
+): Promise<void> {
+  try {
+    await run(uv, args, project, env);
+    return;
+  } catch (error) {
+    signal.throwIfAborted();
+    if (!allowFallback || runtimeLaunchRefusal(uv, error)) throw error;
+    const original = env.UV_PYTHON_INSTALL_MIRROR;
+    const mirrorHost = new URL(PYTHON_DOWNLOAD_MIRROR).host;
+    const viaMirror = original === PYTHON_DOWNLOAD_MIRROR;
+    log(
+      `Python download from ${viaMirror ? mirrorHost : 'GitHub'} failed (${errorSummary(error)}); ` +
+        `retrying from ${viaMirror ? 'GitHub' : mirrorHost}.`,
+    );
+    if (viaMirror) delete env.UV_PYTHON_INSTALL_MIRROR;
+    else env.UV_PYTHON_INSTALL_MIRROR = PYTHON_DOWNLOAD_MIRROR;
+    try {
+      await run(uv, args, project, env);
+    } catch (second) {
+      if (original === undefined) delete env.UV_PYTHON_INSTALL_MIRROR;
+      else env.UV_PYTHON_INSTALL_MIRROR = original;
+      throw second;
     }
   }
 }
@@ -1220,6 +1311,7 @@ async function interpreterCanary(
   run: RuntimeRunner,
   signal: AbortSignal,
   downloads: MirrorReporter,
+  allowMirrorFallback = false,
 ): Promise<void> {
   const refused = (program: string, error: unknown) => {
     const refusal = runtimeLaunchRefusal(program, error);
@@ -1235,7 +1327,16 @@ async function interpreterCanary(
   let python = '';
   try {
     // Stays inside the runtime: no user-wide python on PATH, no Windows registry entry.
-    await run(uv, ['python', 'install', '--no-bin', '--no-registry', request], project, env);
+    await installManagedPython(
+      uv,
+      ['python', 'install', '--no-bin', '--no-registry', request],
+      project,
+      env,
+      run,
+      signal,
+      allowMirrorFallback,
+      downloads.log,
+    );
     signal.throwIfAborted();
     const found = await run(uv, ['python', 'find', '--managed-python', request], project, env, {
       timeoutMs: CANARY_TIMEOUT_MS,
@@ -1410,15 +1511,26 @@ export async function installRuntime(
   const pythonArgs = existingPython
     ? ['--python', runtimePython(project)]
     : ['--managed-python', '--python', managedPythonRequest()];
-  if (!existingPython) await interpreterCanary(uv, project, env, run, signal, downloads);
+  if (!existingPython)
+    await interpreterCanary(
+      uv,
+      project,
+      env,
+      run,
+      signal,
+      downloads,
+      region === 'auto' && !process.env.UV_PYTHON_INSTALL_MIRROR,
+    );
   const cpuTorch = torch.variant === 'cpu';
+  const linuxRocm = process.platform === 'linux' && torch.variant === 'rocm';
+  const overlayTorch = cpuTorch || linuxRocm;
   // A failed native import may leave distribution metadata intact, so uv's
   // ordinary sync would otherwise consider the broken wheel already satisfied.
   const torchPackages: readonly string[] = RUNTIME_REPAIR_PACKAGES;
-  // A CPU install never syncs the lock's CUDA torch, so its repair goes through
-  // the CPU pip install below instead of `uv sync --reinstall-package`.
+  // CPU and Linux ROCm never sync the lock's CUDA torch. Repair their native
+  // wheels through the matching pip overlay below, not the frozen CUDA sync.
   const repairArgs = repairPackages
-    .filter((name) => !cpuTorch || !torchPackages.includes(name))
+    .filter((name) => !overlayTorch || !torchPackages.includes(name))
     .flatMap((name) => ['--reinstall-package', name]);
   signal.throwIfAborted();
   if (repairPackages.length && !resuming) {
@@ -1431,25 +1543,38 @@ export async function installRuntime(
     await run(uv, ['cache', 'clean', ...repairPackages], project, env);
     signal.throwIfAborted();
   }
+  const cudaPackages = overlayTorch
+    ? cudaOnlyPackages(await readFile(join(project, 'uv.lock'), 'utf8'))
+    : [];
+  if (overlayTorch && existingPython && cudaPackages.length) {
+    // A CUDA sync may finish before verification updates .runtime-torch.
+    // Remove its runtime payloads independently of that historical marker,
+    // keeping matching CPU/ROCm torch and shared locked dependencies intact.
+    signal.throwIfAborted();
+    await run(
+      uv,
+      ['pip', 'uninstall', '--python', runtimePython(project), ...cudaPackages],
+      project,
+      env,
+    );
+    signal.throwIfAborted();
+  }
+  const keepTorchOverlay =
+    overlayTorch &&
+    existingPython &&
+    (await readFile(join(project, RUNTIME_TORCH_MARKER), 'utf8').catch(() => '')) === torch.variant;
   // The lock resolves torch to the CUDA build (and, on Linux, ~3 GB of nvidia-*
-  // runtime wheels) for every Linux/Windows x64 host. Keep those out of a CPU
-  // install; the CPU wheels are laid down right after the frozen sync.
+  // runtime wheels) for every Linux/Windows x64 host. CPU and Linux ROCm lay
+  // down their own torch wheels after syncing the remaining locked dependencies.
   const skipArgs = windowsRocm
     ? windowsRocmSyncArgs(await readFile(join(project, 'uv.lock'), 'utf8'))
-    : cpuTorch
+    : overlayTorch
       ? [
           // Exact sync uninstalls every skipped package, so each Resume or
-          // Repair removed the CPU torch it then had to lay down again (#3475).
-          // Only keep what a CPU install laid down: switching from a CUDA
-          // runtime must still remove its multi-GB CUDA wheels.
-          ...((await readFile(join(project, RUNTIME_TORCH_MARKER), 'utf8').catch(() => '')) ===
-          'cpu'
-            ? ['--inexact']
-            : []),
-          ...[
-            ...torchPackages,
-            ...cudaOnlyPackages(await readFile(join(project, 'uv.lock'), 'utf8')),
-          ].flatMap((name) => ['--no-install-package', name]),
+          // Repair would remove the matching CPU/ROCm overlay (#3475). A
+          // switch from CUDA must still remove its multi-GB runtime wheels.
+          ...(keepTorchOverlay ? ['--inexact'] : []),
+          ...[...torchPackages, ...cudaPackages].flatMap((name) => ['--no-install-package', name]),
         ]
       : [];
   const syncArgs = ['sync', '--frozen', '--no-dev', ...pythonArgs, ...repairArgs, ...skipArgs];
@@ -1479,7 +1604,7 @@ export async function installRuntime(
         mirror,
         () => run(uv!, syncArgs, project, env),
         signal,
-        downloads,
+        { ...downloads, allowOriginMirrorFallback: region === 'auto' },
         localUrls,
       );
     },

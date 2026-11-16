@@ -192,6 +192,11 @@ def _pick_gpu_workers() -> int:
         except ValueError:
             logger.warning("OMNIVOICE_GPU_WORKERS=%r is not an integer; ignoring", override)
     try:
+        from core.device_caps import gpu_probe_skipped
+
+        # CPU was chosen: one worker, sized without touching a GPU driver (#4006).
+        if gpu_probe_skipped():
+            return 1
         torch = _lazy_torch()
         if hasattr(torch, "cuda") and torch.cuda.is_available():
             free_bytes, _total = torch.cuda.mem_get_info()
@@ -293,6 +298,8 @@ class _ResilientGpuPool(Executor):
         # so wrapping the callable is the one place that sees queue→run→done
         # for the whole pool.
         token = {"counted": False}
+        from core import diagnostic_reports
+        fn = diagnostic_reports.bind_callable(fn)
 
         def _tracked(*a, **kw):
             with self._stats_lock:
@@ -838,6 +845,8 @@ async def run_on_gpu_pool_guarded(fn, *, what: str = "GPU job",
     finalizer. Normal completion never calls it. This lets request-owned temp
     files outlive abandoned workers without delaying ordinary requests (#1668).
     """
+    from core import diagnostic_reports
+    diagnostic_epoch = diagnostic_reports.inherited_grant()
     from services.inference_cancellation import InferenceCancellation
     cancellation = InferenceCancellation()
     loop = asyncio.get_running_loop()
@@ -895,7 +904,7 @@ async def run_on_gpu_pool_guarded(fn, *, what: str = "GPU job",
                 _fire_abandon_callback()
 
     from core.render_trace import bind as bind_render_trace
-    concurrent_fut = ex.submit(bind_render_trace(_job))
+    concurrent_fut = ex.submit(bind_render_trace(diagnostic_reports.bind_callable(_job, diagnostic_epoch)))
     fut = asyncio.wrap_future(concurrent_fut, loop=loop)
 
     def _abandon() -> None:
@@ -1637,8 +1646,12 @@ def check_device_compatibility():
     ``core.device_caps.arch_unsupported()`` — shared with the probe, and
     CUDA/ROCm-aware (a ROCm build lists ``gfx…``, not ``sm_…`` — #1228).
     """
-    from core.device_caps import arch_unsupported
+    from core.device_caps import arch_unsupported, gpu_probe_skipped
 
+    # CPU was chosen: no GPU is used, and asking CUDA would initialise the
+    # driver that choice avoids (/system/notifications polls this, #4006).
+    if gpu_probe_skipped():
+        return True, None
     torch = _lazy_torch()
     if not torch.cuda.is_available():
         return True, None
@@ -1693,8 +1706,15 @@ def get_best_device():
     """
     from core.device_caps import detect_host_caps
 
+    caps = detect_host_caps()
+    # An explicit CPU choice (Settings, OMNIVOICE_DEVICE=cpu, or the failure
+    # screen's Restart on CPU after a graphics driver crash) means CPU, decided
+    # before any GPU runtime is touched: on a DirectML host the branch below
+    # would otherwise land on the same driver again. The probe skipped GPUs too.
+    if getattr(caps, "requested_family", None) == "cpu":
+        return "cpu"
     torch = _lazy_torch()
-    family = detect_host_caps().family
+    family = caps.family
 
     # ── NVIDIA CUDA or AMD ROCm (both present through torch.cuda) ─────
     if family in ("cuda", "rocm"):
@@ -2694,10 +2714,21 @@ def _load_model_sync():
         from omnivoice.utils.dtype import tts_dtype_name
 
         checkpoint = resolve_omnivoice_checkpoint()
+        # Recovery must identify resident bytes, not weights replaced on disk
+        # after loading. Keep this snapshot on the model that actually loaded.
+        resume_fingerprint = None
+        try:
+            from core.model_fingerprint import tree_fingerprint
+            if os.path.isabs(checkpoint) or os.path.isdir(checkpoint):
+                resume_fingerprint = tree_fingerprint(os.path.realpath(checkpoint))
+        except Exception as err:  # noqa: BLE001 - optional recovery proof
+            logger.debug("Recovery fingerprint unavailable: %s", type(err).__name__)
+        local_fingerprint = None
         if not os.environ.get("OMNIVOICE_MODEL", "").strip():
-            from services.local_model_paths import get, validate
+            from services.local_model_paths import get, loading_fingerprint, validate
             if checkpoint == get("tts", "omnivoice"):
                 validate("tts", "omnivoice", checkpoint)
+                local_fingerprint = loading_fingerprint(checkpoint)
         _set_loading("loading_weights", f"Loading TTS weights on {device}…")
         logger.info("Loading VoiceStudio model on device: %s", device)
         preload_asr = should_preload_tts_asr()
@@ -2998,6 +3029,12 @@ def _load_model_sync():
         # caller timed out. Instance metadata keeps /model/status honest.
         try:
             setattr(_model, "_voicestudio_checkpoint", checkpoint)
+            if resume_fingerprint is not None:
+                # Native loading can read many files. A tree that changed
+                # during that interval cannot certify the resident bytes.
+                if tree_fingerprint(os.path.realpath(checkpoint)) != resume_fingerprint:
+                    resume_fingerprint = None
+            setattr(_model, "_voicestudio_weights_fingerprint", resume_fingerprint)
             setattr(
                 _model,
                 "_voicestudio_loaded_at",
@@ -3009,6 +3046,9 @@ def _load_model_sync():
             # back to the effective configured checkpoint below.
             logger.debug("Could not attach resident model identity", exc_info=True)
 
+        if local_fingerprint is not None:
+            from services.local_model_paths import note_loaded
+            note_loaded("tts", "omnivoice", checkpoint, local_fingerprint)
         _set_loading("ready", "Model ready", progress=100)
         logger.info("VoiceStudio model loaded successfully.")
         return _model
@@ -3036,6 +3076,8 @@ def _load_model_sync():
                 "Model load aborted: shutdown during load — benign, not a failure."
             )
             raise ModelLoadInterruptedByShutdown("shutdown during load") from exc
+        from core import diagnostic_reports
+        diagnostic_reports.capture_failure("model_load", error=exc, engine_id="omnivoice")
         # Surface an ACTIONABLE, sanitized error in /model/status (it's shown in
         # the first-run System Check). build_failure classifies the cause and
         # attaches a fix hint — e.g. a corrupted transformers install
@@ -3408,8 +3450,16 @@ def _release_idle_tts_memory(stage):
             release_transcription_backend(0.0)
         except Exception:  # noqa: BLE001 -- best-effort, never blocks the caller
             logger.debug("capture-ASR pre-%s release failed", stage, exc_info=True)
-        release_tts_side_caches()
-        free_vram()
+        release_tts_side_caches(keep_passage_choices=stage == "generate")
+        if stage == "generate":
+            # Warm generates can overlap inference on other GPU-pool workers,
+            # so skip free_vram()'s cuBLAS workspace clear: it belongs on
+            # unload paths only and is not thread-safe on older torch builds.
+            import gc
+            gc.collect()
+            release_device_cache()
+        else:
+            free_vram()
     except Exception:  # noqa: BLE001 -- a cleanup failure must never break the caller
         logger.debug("pre-%s memory reclaim skipped", stage, exc_info=True)
 
@@ -3419,7 +3469,11 @@ def _should_make_room_for_generate():
 
     Modes (OMNIVOICE_FREE_VRAM_BEFORE_GENERATE):
       auto (default): free when free system RAM is below the unified headroom,
-        mirroring _make_room_before_tts_load. A roomy machine pays nothing.
+        mirroring _make_room_before_tts_load, or when a CUDA/ROCm GPU's free
+        VRAM is below the figure that logs "Low GPU memory". On a small
+        dedicated card a nearly full VRAM makes the driver spill the generate
+        into shared system memory, which runs several times slower even with
+        plenty of RAM. A roomy machine pays nothing.
       always: free before every generate (small per-call cost from gc.collect +
         cache drop).
       never: opt out.
@@ -3430,9 +3484,13 @@ def _should_make_room_for_generate():
     if mode == "always":
         return True
     try:
-        from services.memory_budget import available_memory
-        free_gb = (available_memory() or {}).get("ram_available_gb")
+        from services.memory_budget import _LOW_RAM_HEADROOM_GB, available_memory
+        mem = available_memory() or {}
+        free_gb = mem.get("ram_available_gb")
         if free_gb is not None and free_gb < _UNIFIED_OFFLOAD_HEADROOM_GB:
+            return True
+        vram_free_gb = mem.get("vram_free_gb")
+        if vram_free_gb is not None and vram_free_gb < _LOW_RAM_HEADROOM_GB:
             return True
     except Exception:  # noqa: BLE001 -- a probe failure must never block a generate
         logger.debug("make_room memory probe failed", exc_info=True)
@@ -3488,6 +3546,8 @@ async def preload_model():
     global model, _last_used
     if model is not None:
         return  # already loaded
+    from core import diagnostic_reports
+    diagnostic_epoch = diagnostic_reports.inherited_grant()
 
     # This singleton belongs to native OmniVoice, not the selected engine's
     # adapter. Warming it for another engine wastes memory before first use.
@@ -3552,7 +3612,7 @@ async def preload_model():
         _last_used = time.time()
         async with _model_lock:
             if model is None:
-                model = await _load_model_with_timeout()
+                model = await diagnostic_reports.await_owned(_load_model_with_timeout(), diagnostic_epoch)
         logger.info("Preload complete — model ready.")
     except ModelLoadInterruptedByShutdown:
         # Expected teardown (#1174): the backend was shut down while the
@@ -3565,6 +3625,8 @@ async def preload_model():
         # (#1000 class) — the full chain, not just str(e), is what actually
         # distinguishes a real dependency problem from a shutdown-interrupted
         # import.
+        if diagnostic_epoch is not None:
+            diagnostic_reports.capture_failure("model_load", error=e, engine_id="omnivoice", expected_epoch=diagnostic_epoch)
         logger.warning("Model preload failed (non-fatal): %s", e, exc_info=e)
         # Non-fatal must not mean invisible (#1415). A broken dependency in the
         # model's import chain fails here and nowhere else until the user tries
@@ -3765,7 +3827,7 @@ async def idle_worker():
                 await run_release(_release_idle_model)
         await run_release(_release_idle_side_models, idle_timeout)
 
-def release_tts_side_caches():
+def release_tts_side_caches(*, keep_passage_choices=False):
     """Drop caches keyed to the TTS model, for when the model itself is released.
 
     The voice-clone prompt cache (services.tts_backend) holds encoded reference
@@ -3792,7 +3854,7 @@ def release_tts_side_caches():
     if mod is None:
         return
     try:
-        mod.clear_clone_prompt_cache()
+        mod.clear_clone_prompt_cache(keep_passage_choices=keep_passage_choices)
     except Exception:  # noqa: BLE001
         logger.debug("clone-prompt cache clear failed during unload", exc_info=True)
 
@@ -3868,6 +3930,13 @@ def release_device_cache(*, device: str | None = None, raise_on_failure: bool = 
     ``free_vram()``'s original contract for unload callers that report a failed
     flush to the user.
     """
+    if device is None:
+        from core.device_caps import gpu_probe_skipped
+
+        # CPU was chosen: no accelerator holds a cache, and probing for one
+        # would initialise the driver that choice avoids (#4006).
+        if gpu_probe_skipped():
+            return
     torch = _lazy_torch()
     try:
         name = str(device).split(":", 1)[0] if device is not None else _active_accelerator_name(torch)

@@ -113,6 +113,20 @@ describe('toGenerateForm', () => {
     );
   });
 
+  it('pins a requested engine and resolves steps against it, not the active one', () => {
+    // Best quality on a pinned Supertonic3 is its own 12, even when the default
+    // engine argument (Settings' active engine) is OmniVoice with best 32.
+    const pinned = toGenerateForm(
+      { ...BASE_INPUT, steps: null, engine: 'supertonic3' },
+      'omnivoice',
+    );
+    expect(pinned.get('engine')).toBe('supertonic3');
+    expect(pinned.get('num_step')).toBe('12');
+    const unpinned = toGenerateForm({ ...BASE_INPUT, steps: null }, 'omnivoice');
+    expect(unpinned.has('engine')).toBe(false);
+    expect(unpinned.get('num_step')).toBe('32');
+  });
+
   it('sends the picked preset voice only when one is set (#2938)', () => {
     expect(toGenerateForm(BASE_INPUT).has('preset_voice')).toBe(false);
     expect(toGenerateForm({ ...BASE_INPUT, presetVoice: 'F3' }).get('preset_voice')).toBe('F3');
@@ -387,7 +401,7 @@ describe('generateClone', () => {
     const pending = generateClone({ ...BASE_INPUT, profileId: 'p1' });
     let settled = false;
     pending.catch(() => {}).finally(() => (settled = true));
-    const assertion = expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    const assertion = expect(pending).rejects.toMatchObject({ name: 'TimeoutError' });
     // Still waiting where the old 21-minute backstop gave up on a job the
     // backend was legitimately queueing (30 min) or cold-loading.
     await vi.advanceTimersByTimeAsync(generateAbortMs(BASE_INPUT.text.length) - 1);

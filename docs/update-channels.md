@@ -19,6 +19,10 @@ It is locked while an update is downloading or waiting to restart.
 - **Beta rolls forward onto Stable.** When a stable release passes your beta
   (for example `0.5.9` after `0.5.9-beta.3`), Beta installs it, so you never
   linger on an old beta.
+- **Each channel lists only its own releases.** Under **Settings → Updates →
+  Releases**, Stable lists stable releases and Beta lists betas. When a stable
+  release is newer than every beta (and than your installed beta), Beta shows it
+  above the list with a **Switch to Stable** button instead of mixing it in.
 - **Switching back to Stable never downgrades.** If your beta is newer than the
   latest stable, you stay on it until the next stable release.
 - Beta builds are GitHub *prereleases*: they never become the `latest` release
@@ -53,6 +57,8 @@ the version's GitHub release page. VoiceStudio only offers **Restart** after
 the package has downloaded and passed the updater's checksum verification.
 Restarting while work runs asks first ("Restarting will stop running
 tasks"); drafts are flushed before the restart.
+Update status stays available until the window closes, including while the
+local engine is shutting down for the restart.
 
 A verified update also installs when you quit VoiceStudio on macOS, Windows
 and the Linux AppImage, so **Later** just hides the prompt for that version.

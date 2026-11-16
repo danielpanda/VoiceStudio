@@ -34,6 +34,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import socket
 import subprocess  # nosec B404 -- executable and args are resolved locally
 import threading
@@ -59,6 +60,11 @@ _POLL_S = 0.25
 #: Generation controls only the per-request CLI accepts. A request that sets
 #: one of them keeps its exact behaviour by taking the spawn path.
 _SPAWN_ONLY_CONTROLS = ("duration", "chunk_duration", "chunk_threshold")
+
+
+#: MaskGIT decode steps the runtime uses when none is given. The pinned
+#: ``tts-server`` ignores a ``steps`` field, so it always decodes this many.
+DEFAULT_DECODE_STEPS = 32
 
 
 class ResidentUnavailable(RuntimeError):
@@ -102,7 +108,8 @@ def server_status() -> tuple[bool, str]:
         _STATUS_CACHE[key] = result
         return result
     except Exception as exc:  # noqa: BLE001 -- status must never raise
-        return False, f"{type(exc).__name__}: {exc}"
+        # No exception text: it can carry an absolute path (home directory).
+        return False, f"the tts-server binary could not be checked ({type(exc).__name__})"
 
 
 def _verify_server_binary(path: Path) -> tuple[bool, str]:
@@ -131,6 +138,20 @@ def _verify_server_binary(path: Path) -> tuple[bool, str]:
         except OSError:
             return False, f"{path.name} is not executable"
     return True, "ready"
+
+
+_UNAVAILABLE_LOGGED: set[str] = set()
+_ABSOLUTE_PATH = re.compile(r"(?:[A-Za-z]:)?[\\/][^\s:'\"]+(?:[\\/][^\s:'\"]*)+")
+
+
+def log_unavailable_once(why: str) -> None:
+    """Say once per reason why the opt-in resident mode fell back to the CLI."""
+    # Reasons name files by basename; strip any absolute path that slipped in
+    # (a filesystem error message) so the log never exposes a home directory.
+    why = _ABSOLUTE_PATH.sub("<path>", why)
+    if why not in _UNAVAILABLE_LOGGED:
+        _UNAVAILABLE_LOGGED.add(why)
+        logger.info("OmniVoice GGUF resident mode is on but unavailable; using the per-request runtime: %s", why)
 
 
 def resident_enabled() -> bool:
@@ -188,8 +209,12 @@ class ResidentServer:
         self.process = None
         self.port: Optional[int] = None
         self.pair: Optional[tuple[str, str]] = None
+        #: The ``GGML_BACKEND`` the process was launched with ("" = automatic).
+        self.compute: Optional[str] = None
         self.voices: dict[str, str] = {}
         self.log_handle = None
+        #: Where this process's output starts in the shared, appended log.
+        self.log_start = 0
         #: (binary identity, pair) whose start failed: skip straight to the
         #: spawn path instead of paying a failing start on every request.
         self.failed_start: Optional[tuple] = None
@@ -206,7 +231,13 @@ class ResidentServer:
         from . import backend
 
         pair = (str(base), str(tokenizer))
-        if self.alive() and self.pair == pair:
+        try:
+            env = backend._spawn_env()
+        except Exception as exc:  # an invalid compute override
+            raise ResidentUnavailable(f"tts-server did not start: {exc}") from exc
+        compute = env.get("GGML_BACKEND", "")
+        # A compute change (CPU to GPU, another device) needs a new process too.
+        if self.alive() and self.pair == pair and self.compute == compute:
             return
         self.stop()
         binary = server_binary_path()
@@ -224,17 +255,19 @@ class ResidentServer:
         log_path = _log_path()
         log_path.parent.mkdir(parents=True, exist_ok=True)
         self.log_handle = log_path.open("ab")
+        self.log_start = self.log_handle.tell()
         try:
             self.process = spawn_owned(
                 args,
                 stdout=self.log_handle,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
-                env=backend._spawn_env(),
+                env=env,
                 # Same rule as the CLI: ggml's backend scan stays inside bin/.
                 cwd=str(binary.parent),
             )
             self.pair = pair
+            self.compute = compute
             self._wait_ready(Path(base).name)
         except Exception as exc:
             self.stop()
@@ -272,6 +305,7 @@ class ResidentServer:
         """Stop the process and forget its voices. Idempotent."""
         proc, self.process = self.process, None
         self.pair = None
+        self.compute = None
         self.port = None
         self.voices.clear()
         if proc is not None:
@@ -287,6 +321,16 @@ class ResidentServer:
         if self.log_handle:
             self.log_handle.close()
             self.log_handle = None
+
+    def runtime_log(self, limit: int = 64 * 1024) -> str:
+        """This process's own output so far (its device lines), never an
+        earlier server's. Empty when the log cannot be read."""
+        try:
+            with _log_path().open("rb") as handle:
+                handle.seek(self.log_start)
+                return handle.read(limit).decode("utf-8", errors="replace")
+        except OSError:
+            return ""
 
     # ── protocol ────────────────────────────────────────────────────────
 
@@ -333,8 +377,11 @@ class ResidentServer:
         return body
 
 
+_STEPS_IGNORED_LOGGED = False
+
+
 def speech_payload(text: str, *, voice: Optional[str], language: Optional[str],
-                   instruct: Optional[str], seed) -> dict:
+                   instruct: Optional[str], seed, steps=None) -> dict:
     """The ``/v1/audio/speech`` body for one request (WAV, one shot)."""
     # The CLI trims trailing newlines from stdin; keep the same input.
     payload: dict = {"input": text.rstrip("\r\n"), "response_format": "wav"}
@@ -346,6 +393,20 @@ def speech_payload(text: str, *, voice: Optional[str], language: Optional[str],
         payload["instructions"] = instruct
     if seed is not None:
         payload["seed"] = int(seed)
+    if steps is not None:
+        # Sent for runtimes whose tts-server reads it; the pinned one ignores
+        # unknown fields and decodes DEFAULT_DECODE_STEPS. Not routed to the
+        # CLI: dubbing sends 8/16 per segment, and a cold spawn per segment
+        # would undo the warm server the user turned on for speed.
+        payload["steps"] = int(steps)
+        global _STEPS_IGNORED_LOGGED
+        if int(steps) != DEFAULT_DECODE_STEPS and not _STEPS_IGNORED_LOGGED:
+            _STEPS_IGNORED_LOGGED = True
+            logger.info(
+                "GGUF resident server: num_step=%d sent as 'steps'; the pinned tts-server "
+                "decodes %d. Turn resident mode off to apply step counts.",
+                int(steps), DEFAULT_DECODE_STEPS,
+            )
     return payload
 
 
