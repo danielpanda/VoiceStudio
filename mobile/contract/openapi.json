@@ -1042,6 +1042,31 @@
     "title": "Body_detect_audio_watermark_watermark_detect_post",
     "type": "object"
    },
+   "Body_dub_from_srt_dub_from_srt_post": {
+    "properties": {
+     "file": {
+      "contentMediaType": "application/octet-stream",
+      "title": "File",
+      "type": "string"
+     },
+     "source_lang": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Source Lang"
+     }
+    },
+    "required": [
+     "file"
+    ],
+    "title": "Body_dub_from_srt_dub_from_srt_post",
+    "type": "object"
+   },
    "Body_dub_import_srt_dub_import_srt__job_id__post": {
     "properties": {
      "file": {
@@ -1074,6 +1099,11 @@
       ],
       "title": "Job Id"
      },
+     "separate_background": {
+      "default": true,
+      "title": "Separate Background",
+      "type": "boolean"
+     },
      "source_lang": {
       "anyOf": [
        {
@@ -1095,6 +1125,20 @@
      "video"
     ],
     "title": "Body_dub_upload_dub_upload_post",
+    "type": "object"
+   },
+   "Body_dub_validate_srt_dub_validate_srt_post": {
+    "properties": {
+     "file": {
+      "contentMediaType": "application/octet-stream",
+      "title": "File",
+      "type": "string"
+     }
+    },
+    "required": [
+     "file"
+    ],
+    "title": "Body_dub_validate_srt_dub_validate_srt_post",
     "type": "object"
    },
    "Body_enqueue_batch_job_batch_enqueue_post": {
@@ -1309,6 +1353,13 @@
       ],
       "title": "Num Step"
      },
+     "paragraph_gap_ms": {
+      "default": 0,
+      "maximum": 5000.0,
+      "minimum": 0.0,
+      "title": "Paragraph Gap Ms",
+      "type": "integer"
+     },
      "position_temperature": {
       "anyOf": [
        {
@@ -1416,6 +1467,11 @@
      "text": {
       "title": "Text",
       "type": "string"
+     },
+     "trim_engine_silence": {
+      "default": false,
+      "title": "Trim Engine Silence",
+      "type": "boolean"
      },
      "wav_bits": {
       "default": "16",
@@ -11341,6 +11397,38 @@
     "summary": "Convert Speech"
    }
   },
+  "/demo/dubbing/download": {
+   "post": {
+    "operationId": "demo_dubbing_download_demo_dubbing_download_post",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "Demo Dubbing Download"
+   }
+  },
+  "/demo/dubbing/status": {
+   "get": {
+    "operationId": "demo_dubbing_status_demo_dubbing_status_get",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "Demo Dubbing Status"
+   }
+  },
   "/design/describe": {
    "post": {
     "description": "Parse a free-text description into design attrs + a validator-safe instruct.\n\nResponse shape::\n\n    {\n      \"attrs\":     {\"Gender\": \"female\", \"Age\": \"elderly\", ... or \"Auto\"},\n      \"instruct\":  \"female, elderly, low pitch, british accent\",\n      \"matched\":   [{\"category\": \"Age\", \"token\": \"elderly\", \"phrase\": \"elderly\"}, ...],\n      \"unmatched\": [\"slightly raspy\"]\n    }",
@@ -12500,6 +12588,43 @@
     "summary": "Dub Export Stems"
    }
   },
+  "/dub/from-srt": {
+   "post": {
+    "description": "Create a speech-only project, with no media preparation or ASR.",
+    "operationId": "dub_from_srt_dub_from_srt_post",
+    "requestBody": {
+     "content": {
+      "multipart/form-data": {
+       "schema": {
+        "$ref": "#/components/schemas/Body_dub_from_srt_dub_from_srt_post"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Dub From Srt"
+   }
+  },
   "/dub/generate/{job_id}": {
    "post": {
     "description": "Adds a dub generation job to the async batch task pool.",
@@ -12565,7 +12690,22 @@
     "summary": "Clear Dub History"
    },
    "get": {
+    "description": "Recent dub rows. The list omits ``job_data`` (every segment and path of\neach job, often megabytes) unless ``?full=1``; nothing in the apps reads it\nfrom here \u2014 a single job loads through its own routes.",
     "operationId": "list_dub_history_dub_history_get",
+    "parameters": [
+     {
+      "description": "Include each row's full `job_data` blob (large).",
+      "in": "query",
+      "name": "full",
+      "required": false,
+      "schema": {
+       "default": false,
+       "description": "Include each row's full `job_data` blob (large).",
+       "title": "Full",
+       "type": "boolean"
+      }
+     }
+    ],
     "responses": {
      "200": {
       "content": {
@@ -12574,6 +12714,16 @@
        }
       },
       "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
      }
     },
     "summary": "List Dub History"
@@ -13773,6 +13923,43 @@
      }
     },
     "summary": "Dub Use Downloaded Captions"
+   }
+  },
+  "/dub/validate-srt": {
+   "post": {
+    "description": "Validate a selected subtitle file without starting or changing a job.",
+    "operationId": "dub_validate_srt_dub_validate_srt_post",
+    "requestBody": {
+     "content": {
+      "multipart/form-data": {
+       "schema": {
+        "$ref": "#/components/schemas/Body_dub_validate_srt_dub_validate_srt_post"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Dub Validate Srt"
    }
   },
   "/dub/vtt/{job_id}": {

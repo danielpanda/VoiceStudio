@@ -42,15 +42,20 @@ export class DiagnosticStatusObserver {
   observe(status: BackendStatus): void {
     if (status.remote) return;
     const activeAttempt = ['attaching', 'starting', 'installing'];
-    if (activeAttempt.includes(status.stage) && !activeAttempt.includes(this.previousStage)) {
-      // Setup/start and child-exit recovery publish before their first await.
-      // Progress and installing → starting → attaching are one owned attempt;
-      // none may acquire permission granted while that attempt was running.
-      this.attemptOwner = { epoch: this.reports.status().grant_epoch ?? null };
+    const newAttempt =
+      activeAttempt.includes(status.stage) && !activeAttempt.includes(this.previousStage);
+    if (newAttempt) {
+      // Restart may publish its first active status only after stopping a child.
+      // Inherit that operation's owner, including OFF; independent lifecycle
+      // attempts without an operation observe permission at their first status.
+      this.attemptOwner = diagnosticOperationOwner(this.reports) ?? {
+        epoch: this.reports.status().grant_epoch ?? null,
+      };
     } else if (['idle', 'ready'].includes(status.stage)) {
       this.attemptOwner = null;
     }
     if (
+      newAttempt ||
       (['installing', 'starting'].includes(status.stage) && status.stage !== this.previousStage) ||
       status.elapsedMs < this.previousElapsed
     )
@@ -114,7 +119,12 @@ export function installDiagnosticProcessCapture(
   source: MainProcessErrorSource = process,
 ): () => void {
   const stopTracking = trackDiagnosticOperations();
-  const capture = (error: unknown, reason: string, expectedEpoch?: string) => {
+  const capture = (
+    error: unknown,
+    reason: string,
+    error_code: string,
+    expectedEpoch?: string,
+  ) => {
     try {
       if (!reports.enabled) return;
       if (
@@ -123,7 +133,7 @@ export function installDiagnosticProcessCapture(
       )
         return;
       reports.capture(
-        { category: 'app_crash', stage: 'other', reason, ...projectException(error) },
+        { category: 'app_crash', stage: 'other', reason, error_code, ...projectException(error) },
         expectedEpoch,
       );
     } catch {
@@ -136,11 +146,11 @@ export function installDiagnosticProcessCapture(
     if (origin === 'unhandledRejection') return;
     const owner = diagnosticOperationOwner(reports, error);
     if (!owner || owner.epoch === null) return;
-    capture(error, 'unhandled_exception', owner.epoch);
+    capture(error, 'unhandled_exception', 'MAIN_UNCAUGHT_EXCEPTION', owner.epoch);
   };
   const rejected = (error: unknown, promise?: Promise<unknown>) => {
     const epoch = diagnosticRejectionEpoch(promise, reports, error);
-    if (epoch !== null) capture(error, 'unhandled_rejection', epoch);
+    if (epoch !== null) capture(error, 'unhandled_rejection', 'MAIN_UNHANDLED_REJECTION', epoch);
   };
   source.on('uncaughtExceptionMonitor', fatal);
   source.on('unhandledRejection', rejected);
@@ -151,6 +161,13 @@ export function installDiagnosticProcessCapture(
   };
 }
 
+/** Electron's fixed child-process type enum; the free-text service name is never read. */
+function childProcessCode(type: string | undefined): string {
+  if (type === 'GPU') return 'GPU_PROCESS_GONE';
+  if (type === 'Utility') return 'UTILITY_PROCESS_GONE';
+  return 'OTHER_CHILD_PROCESS_GONE';
+}
+
 /** Electron provides these reasons; normal/expected exits and arbitrary strings are ignored. */
 export function captureProcessGone(
   reports: Pick<DiagnosticReports, 'capture'>,
@@ -158,6 +175,7 @@ export function captureProcessGone(
   reason: string,
   exitCode: number,
   expected = false,
+  processType?: string,
 ): void {
   if (
     expected ||
@@ -177,6 +195,7 @@ export function captureProcessGone(
           'integrity-failure': 'integrity_failure',
         } as Record<string, string>
       )[reason] ?? reason,
+    ...(renderer ? {} : { error_code: childProcessCode(processType) }),
     exit_code: exitCode,
   });
 }
